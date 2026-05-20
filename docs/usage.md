@@ -91,12 +91,21 @@ See [Skill Registry](skill-registry.md) for the full index-first flow and diagra
 
 Refresh managed assets to the current version. Use after `brew upgrade gentle-ai` or when you want your local configs aligned with the latest release. Does NOT reinstall binaries (engram, GGA) — only updates prompt content, skills, MCP configs, and SDD orchestrators.
 
+> **Important:** `gentle-ai sync` updates the agents recorded as installed by Gentle AI, not every AI agent config directory on your machine.
+>
+> Gentle AI stores your selected install targets in `~/.gentle-ai/state.json`. Future `sync` runs use that stored selection so Gentle AI does not accidentally write into tools you did not choose to manage. If you rerun install and select only one agent, that new selection becomes the default sync scope.
+>
+> Before syncing, you can preview the active scope with `gentle-ai sync --dry-run`. If you want to sync agents outside the stored selection, pass them explicitly with `--agent`.
+
 ```bash
-# Sync all installed agents
+# Preview which agents sync will update
+gentle-ai sync --dry-run
+
+# Sync the agents currently registered in ~/.gentle-ai/state.json
 gentle-ai sync
 
 # Sync specific agents only
-gentle-ai sync --agent cursor --agent windsurf
+gentle-ai sync --agent claude-code --agent opencode
 
 # Sync a specific component
 gentle-ai sync --component sdd

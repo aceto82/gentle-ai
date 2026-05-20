@@ -54,6 +54,18 @@ The installer detects your platform automatically — no flags needed to select 
 
 After completion, verify that agent configs and selected components were installed to their expected paths.
 
+The agents you select during install become the default scope for future `gentle-ai sync` runs. Gentle AI records that selection in `~/.gentle-ai/state.json` and does not automatically sync every agent config directory that exists on your machine. To check what will be updated after an upgrade, run:
+
+```bash
+gentle-ai sync --dry-run
+```
+
+To update a different set explicitly, pass every target agent:
+
+```bash
+gentle-ai sync --agent claude-code --agent opencode
+```
+
 ## Verification outcome
 
 When checks pass, installer reports:

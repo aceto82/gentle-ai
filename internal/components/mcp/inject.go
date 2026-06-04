@@ -8,6 +8,7 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/agents"
 	"github.com/gentleman-programming/gentle-ai/internal/components/filemerge"
 	"github.com/gentleman-programming/gentle-ai/internal/model"
+	"github.com/gentleman-programming/gentle-ai/internal/versions"
 )
 
 type InjectionResult struct {
@@ -28,12 +29,37 @@ func Inject(homeDir string, adapter agents.Adapter) (InjectionResult, error) {
 	case model.StrategyMCPConfigFile:
 		return injectMCPConfigFile(homeDir, adapter)
 	case model.StrategyTOMLFile:
-		// Context7 injection is not supported for TOML-based agents (Codex).
-		// Codex receives Context7 through its agents.md system prompt, not via MCP config.
-		return InjectionResult{}, nil
+		return injectTOMLFile(homeDir, adapter)
 	default:
 		return InjectionResult{}, fmt.Errorf("mcp injector does not support MCP strategy %d for agent %q", adapter.MCPStrategy(), adapter.Agent())
 	}
+}
+
+// context7Args returns the pinned args slice for the Context7 MCP server.
+func context7Args() []string {
+	return []string{"-y", "--package=@upstash/context7-mcp@" + versions.Context7MCP, "--", "context7-mcp"}
+}
+
+// injectTOMLFile upserts the [mcp_servers.context7] block into a TOML-based
+// agent config file (e.g. ~/.codex/config.toml) using a string-based, idempotent
+// helper. The file is created if it does not yet exist.
+func injectTOMLFile(homeDir string, adapter agents.Adapter) (InjectionResult, error) {
+	configPath := adapter.MCPConfigPath(homeDir, "context7")
+
+	existingBytes, err := osReadFile(configPath)
+	if err != nil {
+		return InjectionResult{}, fmt.Errorf("read TOML config %q: %w", configPath, err)
+	}
+
+	existing := string(existingBytes)
+	updated := filemerge.UpsertCodexMCPServerBlock(existing, "context7", "npx", context7Args())
+
+	writeResult, err := filemerge.WriteFileAtomic(configPath, []byte(updated), 0o644)
+	if err != nil {
+		return InjectionResult{}, fmt.Errorf("write TOML config %q: %w", configPath, err)
+	}
+
+	return InjectionResult{Changed: writeResult.Changed, Files: []string{configPath}}, nil
 }
 
 // injectSeparateFile writes a standalone JSON file per MCP server (Claude Code pattern).

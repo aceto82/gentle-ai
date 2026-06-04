@@ -1015,8 +1015,9 @@ func componentPathsWithWorkspaceScoped(homeDir, workspaceDir string, scope Insta
 					paths = append(paths, p)
 				}
 			case model.StrategyTOMLFile:
-				// Codex uses TOML for Engram but Context7 is not injected via TOML.
-				// No path to report — Context7 injection is skipped for TOML agents.
+				if p := adapter.MCPConfigPath(homeDir, "context7"); p != "" {
+					paths = append(paths, p)
+				}
 			}
 		case model.ComponentPersona:
 			if selection.Persona == model.PersonaCustom {

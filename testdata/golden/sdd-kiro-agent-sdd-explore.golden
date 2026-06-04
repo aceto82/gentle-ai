@@ -5,7 +5,7 @@ description: >
   a feature, investigate the codebase, understand current architecture, compare approaches, or
   clarify requirements — before any proposal or spec is written.
 tools: ["read", "@context7", "@engram"]
-model: claude-sonnet-4.6
+model: auto
 includeMcpJson: true
 ---
 

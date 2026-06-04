@@ -5,7 +5,7 @@ description: >
   Use when a proposal exists and the technical architecture needs to be decided before tasks
   are broken down. Produces the design artifact that sdd-tasks depends on.
 tools: ["@builtin", "@engram"]
-model: claude-sonnet-4.6
+model: auto
 includeMcpJson: true
 ---
 

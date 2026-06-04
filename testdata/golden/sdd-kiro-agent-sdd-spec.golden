@@ -5,7 +5,7 @@ description: >
   proposal exists and formal requirements need to be captured in Given/When/Then format.
   Produces the spec artifact that sdd-tasks depends on.
 tools: ["@builtin", "@engram"]
-model: claude-sonnet-4.6
+model: auto
 includeMcpJson: true
 ---
 

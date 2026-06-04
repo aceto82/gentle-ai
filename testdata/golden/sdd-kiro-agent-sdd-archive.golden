@@ -5,7 +5,7 @@ description: >
   needs to be closed — merges delta specs into main specs, moves change folder to archive,
   and persists the final archive report. Completes the SDD cycle.
 tools: ["@builtin", "@engram"]
-model: claude-sonnet-4.6
+model: auto
 includeMcpJson: true
 ---
 

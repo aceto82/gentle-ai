@@ -5,7 +5,7 @@ description: >
   proposal artifact — after exploration is done (or skipped) and before specs or design are written.
   Produces proposal.md or the engram proposal artifact.
 tools: ["@builtin", "@engram"]
-model: claude-sonnet-4.6
+model: auto
 includeMcpJson: true
 ---
 

@@ -5,7 +5,7 @@ description: >
   verification — runs tests, checks spec compliance, validates design coherence. Reports
   CRITICAL / WARNING / SUGGESTION findings. Read-only: does not modify code.
 tools: ["read", "shell", "@engram"]
-model: claude-sonnet-4.6
+model: auto
 includeMcpJson: true
 ---
 

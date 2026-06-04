@@ -2,21 +2,23 @@ package model_test
 
 import (
 	"testing"
+
+	"github.com/gentleman-programming/gentle-ai/internal/model"
 )
 
 func TestCodexEffortValid(t *testing.T) {
 	tests := []struct {
 		name  string
-		input CodexEffort
+		input model.CodexEffort
 		want  bool
 	}{
-		{"low", CodexEffortLow, true},
-		{"medium", CodexEffortMedium, true},
-		{"high", CodexEffortHigh, true},
-		{"xhigh", CodexEffortXHigh, true},
-		{"empty", CodexEffort(""), false},
-		{"junk", CodexEffort("junk"), false},
-		{"uppercase", CodexEffort("HIGH"), false},
+		{"low", model.CodexEffortLow, true},
+		{"medium", model.CodexEffortMedium, true},
+		{"high", model.CodexEffortHigh, true},
+		{"xhigh", model.CodexEffortXHigh, true},
+		{"empty", model.CodexEffort(""), false},
+		{"junk", model.CodexEffort("junk"), false},
+		{"uppercase", model.CodexEffort("HIGH"), false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -30,11 +32,11 @@ func TestCodexEffortValid(t *testing.T) {
 func TestCodexPresetsCoverAllPhases(t *testing.T) {
 	presets := []struct {
 		name string
-		fn   func() map[string]CodexEffort
+		fn   func() map[string]model.CodexEffort
 	}{
-		{"Recommended", CodexModelPresetRecommended},
-		{"Powerful", CodexModelPresetPowerful},
-		{"LowCost", CodexModelPresetLowCost},
+		{"Recommended", model.CodexModelPresetRecommended},
+		{"Powerful", model.CodexModelPresetPowerful},
+		{"LowCost", model.CodexModelPresetLowCost},
 	}
 
 	for _, tc := range presets {
@@ -63,18 +65,18 @@ func TestCodexPresetsCoverAllPhases(t *testing.T) {
 }
 
 func TestRenderCodexPhaseEfforts_Deterministic(t *testing.T) {
-	assignments := CodexModelPresetRecommended()
-	out1 := RenderCodexPhaseEfforts(assignments)
-	out2 := RenderCodexPhaseEfforts(assignments)
+	assignments := model.CodexModelPresetRecommended()
+	out1 := model.RenderCodexPhaseEfforts(assignments)
+	out2 := model.RenderCodexPhaseEfforts(assignments)
 	if out1 != out2 {
 		t.Error("RenderCodexPhaseEfforts() is not deterministic: two calls returned different results")
 	}
 }
 
 func TestRenderCodexPhaseEfforts_NilFallsBackToRecommended(t *testing.T) {
-	nilOut := RenderCodexPhaseEfforts(nil)
-	emptyOut := RenderCodexPhaseEfforts(map[string]CodexEffort{})
-	recommended := RenderCodexPhaseEfforts(CodexModelPresetRecommended())
+	nilOut := model.RenderCodexPhaseEfforts(nil)
+	emptyOut := model.RenderCodexPhaseEfforts(map[string]model.CodexEffort{})
+	recommended := model.RenderCodexPhaseEfforts(model.CodexModelPresetRecommended())
 	if nilOut != recommended {
 		t.Error("RenderCodexPhaseEfforts(nil) should equal Recommended output")
 	}
@@ -84,7 +86,7 @@ func TestRenderCodexPhaseEfforts_NilFallsBackToRecommended(t *testing.T) {
 }
 
 func TestRenderCodexPhaseEfforts_LowCostTierValues(t *testing.T) {
-	out := RenderCodexPhaseEfforts(CodexModelPresetLowCost())
+	out := model.RenderCodexPhaseEfforts(model.CodexModelPresetLowCost())
 	// Low-cost: sdd-strong row = medium, sdd-mid row = medium, sdd-cheap row = low
 	assertContainsSubstring(t, out, "sdd-strong")
 	assertContainsSubstring(t, out, "sdd-mid")
@@ -94,7 +96,7 @@ func TestRenderCodexPhaseEfforts_LowCostTierValues(t *testing.T) {
 }
 
 func TestRenderCodexPhaseEfforts_PowerfulTierValues(t *testing.T) {
-	out := RenderCodexPhaseEfforts(CodexModelPresetPowerful())
+	out := model.RenderCodexPhaseEfforts(model.CodexModelPresetPowerful())
 	// Powerful: sdd-strong row = xhigh, sdd-mid row = high, sdd-cheap row = low
 	assertContainsSubstring(t, out, "sdd-strong")
 	assertContainsSubstring(t, out, "sdd-mid")

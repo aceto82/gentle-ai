@@ -841,6 +841,8 @@ func (m Model) View() string {
 		return screens.RenderClaudeModelPicker(m.ClaudeModelPicker, m.Cursor)
 	case ScreenKiroModelPicker:
 		return screens.RenderKiroModelPicker(m.KiroModelPicker, m.Cursor)
+	case ScreenCodexModelPicker:
+		return screens.RenderCodexModelPicker(m.CodexModelPicker, m.Cursor)
 	case ScreenSDDMode:
 		return screens.RenderSDDMode(m.Selection.SDDMode, m.Cursor)
 	case ScreenStrictTDD:
@@ -1593,6 +1595,11 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 			if m.shouldShowKiroModelPickerScreen() {
 				m.KiroModelPicker = screens.NewKiroModelPickerStateFromAssignments(m.Selection.KiroModelAssignments)
 				m.setScreen(ScreenKiroModelPicker)
+				return m, nil
+			}
+			if m.shouldShowCodexModelPickerScreen() {
+				m.CodexModelPicker = screens.NewCodexModelPickerStateFromAssignments(m.Selection.CodexModelAssignments)
+				m.setScreen(ScreenCodexModelPicker)
 				return m, nil
 			}
 			if m.shouldShowSDDModeScreen() {
@@ -2811,6 +2818,8 @@ func (m Model) optionCount() int {
 		return screens.ClaudeModelPickerOptionCount(m.ClaudeModelPicker)
 	case ScreenKiroModelPicker:
 		return screens.KiroModelPickerOptionCount(m.KiroModelPicker)
+	case ScreenCodexModelPicker:
+		return screens.CodexModelPickerOptionCount()
 	case ScreenSDDMode:
 		return len(screens.SDDModeOptions()) + 1
 	case ScreenStrictTDD:

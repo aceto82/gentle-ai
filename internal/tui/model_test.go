@@ -4152,3 +4152,30 @@ func TestPersonaScreenDoesNotRecomputeForCustomPreset(t *testing.T) {
 		t.Fatalf("components should stay nil for custom preset; got: %v", state.Selection.Components)
 	}
 }
+
+func TestShouldShowCodexModelPickerScreen_TrueWhenCodexAndSDD(t *testing.T) {
+	m := NewModel(system.DetectionResult{}, "dev")
+	m.Selection.Agents = []model.AgentID{model.AgentCodex}
+	m.Selection.Components = []model.ComponentID{model.ComponentEngram, model.ComponentSDD}
+	if !m.shouldShowCodexModelPickerScreen() {
+		t.Fatal("shouldShowCodexModelPickerScreen() = false, want true when Codex+SDD selected")
+	}
+}
+
+func TestShouldShowCodexModelPickerScreen_FalseWhenNoCodex(t *testing.T) {
+	m := NewModel(system.DetectionResult{}, "dev")
+	m.Selection.Agents = []model.AgentID{model.AgentClaudeCode}
+	m.Selection.Components = []model.ComponentID{model.ComponentEngram, model.ComponentSDD}
+	if m.shouldShowCodexModelPickerScreen() {
+		t.Fatal("shouldShowCodexModelPickerScreen() = true, want false when Codex not in agents")
+	}
+}
+
+func TestShouldShowCodexModelPickerScreen_FalseWhenNoSDD(t *testing.T) {
+	m := NewModel(system.DetectionResult{}, "dev")
+	m.Selection.Agents = []model.AgentID{model.AgentCodex}
+	m.Selection.Components = []model.ComponentID{model.ComponentEngram}
+	if m.shouldShowCodexModelPickerScreen() {
+		t.Fatal("shouldShowCodexModelPickerScreen() = true, want false when SDD not in components")
+	}
+}

@@ -364,6 +364,7 @@ func tuiExecute(
 			InstalledAgents:        agentIDs,
 			ClaudeModelAssignments: claudeAliasesToStrings(selection.ClaudeModelAssignments),
 			KiroModelAssignments:   kiroAliasesToStrings(selection.KiroModelAssignments),
+			CodexModelAssignments:  codexEffortsToStrings(selection.CodexModelAssignments),
 			ModelAssignments:       modelAssignmentsToState(selection.ModelAssignments),
 			Persona:                string(selection.Persona),
 		})
@@ -472,6 +473,9 @@ func applyOverrides(selection *model.Selection, overrides *model.SyncOverrides) 
 	if overrides.KiroModelAssignments != nil {
 		selection.KiroModelAssignments = overrides.KiroModelAssignments
 	}
+	if overrides.CodexModelAssignments != nil {
+		selection.CodexModelAssignments = overrides.CodexModelAssignments
+	}
 	if overrides.SDDMode != "" {
 		selection.SDDMode = overrides.SDDMode
 	}
@@ -517,6 +521,13 @@ func loadPersistedAssignments(homeDir string, selection *model.Selection) {
 		}
 		selection.KiroModelAssignments = m
 	}
+	if len(selection.CodexModelAssignments) == 0 && len(s.CodexModelAssignments) > 0 {
+		m := make(map[string]model.CodexEffort, len(s.CodexModelAssignments))
+		for k, v := range s.CodexModelAssignments {
+			m[k] = model.CodexEffort(v)
+		}
+		selection.CodexModelAssignments = m
+	}
 	if len(selection.ModelAssignments) == 0 && len(s.ModelAssignments) > 0 {
 		m := make(map[string]model.ModelAssignment, len(s.ModelAssignments))
 		for k, v := range s.ModelAssignments {
@@ -530,7 +541,7 @@ func loadPersistedAssignments(homeDir string, selection *model.Selection) {
 // state.json using a read-merge-write pattern so that other fields
 // (InstalledAgents) are not lost.
 func persistAssignments(homeDir string, selection model.Selection) {
-	if len(selection.ClaudeModelAssignments) == 0 && len(selection.KiroModelAssignments) == 0 && len(selection.ModelAssignments) == 0 {
+	if len(selection.ClaudeModelAssignments) == 0 && len(selection.KiroModelAssignments) == 0 && len(selection.ModelAssignments) == 0 && len(selection.CodexModelAssignments) == 0 {
 		return
 	}
 	current, err := state.Read(homeDir)
@@ -543,6 +554,9 @@ func persistAssignments(homeDir string, selection model.Selection) {
 	}
 	if len(selection.KiroModelAssignments) > 0 {
 		current.KiroModelAssignments = kiroAliasesToStrings(selection.KiroModelAssignments)
+	}
+	if len(selection.CodexModelAssignments) > 0 {
+		current.CodexModelAssignments = codexEffortsToStrings(selection.CodexModelAssignments)
 	}
 	if len(selection.ModelAssignments) > 0 {
 		current.ModelAssignments = modelAssignmentsToState(selection.ModelAssignments)
@@ -569,6 +583,19 @@ func claudeAliasesToStrings(m map[string]model.ClaudeModelAlias) map[string]stri
 }
 
 func kiroAliasesToStrings(m map[string]model.KiroModelAlias) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = string(v)
+	}
+	return out
+}
+
+// codexEffortsToStrings converts a typed CodexEffort map to plain strings
+// for JSON serialisation in state.json.
+func codexEffortsToStrings(m map[string]model.CodexEffort) map[string]string {
 	if len(m) == 0 {
 		return nil
 	}

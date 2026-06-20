@@ -517,6 +517,11 @@ func TestInjectOpenCodeUsesOpenCodeSpecificOrchestratorPrompt(t *testing.T) {
 			for _, wanted := range []string{
 				"Gentle AI",
 				"Read the configured models from `opencode.json`",
+				"present the proceed/adjust/stop options via the `question` tool",
+				"Use the `question` tool for this between-phase decision",
+				"present the proceed/adjust/stop options through a single `question` tool call",
+				"present that decision via the `question` tool",
+				"Use the `question` tool for this choice: present the two strategy options",
 			} {
 				if !strings.Contains(text, wanted) {
 					t.Fatalf("opencode.json missing OpenCode orchestrator prompt content %q", wanted)
@@ -638,6 +643,8 @@ func TestInjectOpenCodeMigratesPreservedLegacyOrchestratorPromptReferences(t *te
 		"Do NOT show canonical values or other internal values",
 		"map the selected human labels to canonical values internally",
 		"pause after each delegated phase returns",
+		"ask before launching the next phase via the `question` tool",
+		"present the proceed/adjust/stop options through a single `question` tool call",
 		"approve only the immediate next phase",
 		"proposal question round",
 		"business rules, implications, impact, edge cases",
@@ -741,6 +748,8 @@ Map answers to canonical values: A1/Interactive -> interactive.
 		"Do NOT show canonical values or other internal values",
 		"map the selected human labels to canonical values internally",
 		"pause after each delegated phase returns",
+		"ask before launching the next phase via the `question` tool",
+		"present the proceed/adjust/stop options through a single `question` tool call",
 		"approve only the immediate next phase",
 		"proposal question round",
 		"business rules, implications, impact, edge cases",
@@ -847,7 +856,9 @@ Hard gate rules:
 		"not as a generated technical artifact",
 		"Technical artifacts still default to English",
 		"this UI follows the user's conversation language/persona",
-		"for Spanish neutral fallback ask",
+		"for Spanish neutral fallback frame it as",
+		"ask before launching the next phase via the `question` tool",
+		"present the proceed/adjust/stop options through a single `question` tool call",
 		"approve only the immediate next phase",
 		"proposal question round",
 		"business rules, implications, impact, edge cases",

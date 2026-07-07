@@ -10,17 +10,19 @@
 | Linux (Ubuntu/Debian) | apt | Supported |
 | Linux (Arch) | pacman | Supported |
 | Linux (Fedora/RHEL family) | dnf | Supported |
-| Windows 10/11 | Scoop | Supported |
+| Windows 10/11 | PowerShell installer | Supported |
 
 Derivatives are detected via `ID_LIKE` in `/etc/os-release` (Linux Mint, Pop!_OS, Manjaro, EndeavourOS, CentOS Stream, Rocky Linux, AlmaLinux, etc.).
 
-Release artifacts are produced by CI, but Windows users should install through Scoop so upgrades stay consistent.
+Release artifacts are produced by CI. Windows users should install through the PowerShell installer so Gentle AI's built-in updater owns the same binary it installed.
 
 ---
 
 ## Windows Notes
 
-- **Scoop** is the supported Windows install path for Gentle AI.
+- **PowerShell installer** is the recommended Windows install path for Gentle AI:
+  `irm https://raw.githubusercontent.com/Gentleman-Programming/gentle-ai/main/scripts/install.ps1 | iex`
+- **Scoop** is supported as a manual-update alternative. If installed through Scoop, update with `scoop update gentle-ai`; do not rely on Gentle AI's built-in updater for the Scoop shim.
 - **npm global installs** do not require `sudo` on Windows (user-writable by default).
 - **curl** is pre-installed on Windows 10+ and does not require separate installation.
 - **PowerShell** is the default shell when `$SHELL` is not set.

@@ -76,9 +76,10 @@ curl -fsSL https://raw.githubusercontent.com/Gentleman-Programming/gentle-ai/mai
 ### Windows
 
 ```powershell
-scoop bucket add gentleman https://github.com/Gentleman-Programming/scoop-bucket
-scoop install gentle-ai
+irm https://raw.githubusercontent.com/Gentleman-Programming/gentle-ai/main/scripts/install.ps1 | iex
 ```
+
+This installs to `%LOCALAPPDATA%\gentle-ai\bin` and works with Gentle AI's built-in updater.
 
 ### Try the beta channel (test `main` before a release)
 
@@ -96,7 +97,7 @@ curl -fsSL https://raw.githubusercontent.com/Gentleman-Programming/gentle-ai/mai
 $env:GENTLE_AI_CHANNEL="beta"; irm https://raw.githubusercontent.com/Gentleman-Programming/gentle-ai/main/scripts/install.ps1 | iex
 ```
 
-To keep upgrading on beta later, run `GENTLE_AI_CHANNEL=beta gentle-ai upgrade`. To return to stable, reinstall via Homebrew or Scoop.
+To keep upgrading on beta later, run `$env:GENTLE_AI_CHANNEL="beta"; gentle-ai upgrade` on Windows or `GENTLE_AI_CHANNEL=beta gentle-ai upgrade` on macOS/Linux. To return to stable, reinstall with the default installer.
 
 ### After install: project-level setup
 
@@ -122,10 +123,11 @@ Run `gentle-ai doctor` at any time for a read-only health check of your ecosyste
 brew tap Gentleman-Programming/homebrew-tap
 brew trust --formula gentleman-programming/tap/gentle-ai  # one-time, for Homebrew tap trust
 brew install gentle-ai
+```
 
+```powershell
 # Windows
-scoop bucket add gentleman https://github.com/Gentleman-Programming/scoop-bucket
-scoop install gentle-ai
+irm https://raw.githubusercontent.com/Gentleman-Programming/gentle-ai/main/scripts/install.ps1 | iex
 ```
 
 <details>
@@ -137,9 +139,9 @@ scoop install gentle-ai
 go install github.com/gentleman-programming/gentle-ai/cmd/gentle-ai@latest
 ```
 
-#### Windows
+#### Windows alternatives
 
-Use Scoop on Windows. It is the supported install path for keeping Gentle AI updated cleanly:
+Scoop is available, but it is a manual-update path. If you install with Scoop, update with `scoop update gentle-ai`; Gentle AI's built-in updater is designed for the PowerShell installer path.
 
 ```powershell
 scoop bucket add gentleman https://github.com/Gentleman-Programming/scoop-bucket

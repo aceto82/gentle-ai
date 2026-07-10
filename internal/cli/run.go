@@ -45,19 +45,21 @@ type InstallResult struct {
 	Execution    pipeline.ExecutionResult
 	Verify       verify.Report
 	Dependencies system.DependencyReport
+	PiCodeGraph  *communitytool.PiCodeGraphResult
 	DryRun       bool
 }
 
 var (
-	osUserHomeDir        = os.UserHomeDir
-	osSetenv             = os.Setenv
-	osStat               = os.Stat
-	runCommand           = executeCommand
-	cmdLookPath          = exec.LookPath
-	streamCommandOutput  = true
-	goEnv                = defaultGoEnv
-	installCommunityTool = communitytool.Install
-	pathEnvEntries       = func(profile system.PlatformProfile) []string {
+	osUserHomeDir                = os.UserHomeDir
+	osSetenv                     = os.Setenv
+	osStat                       = os.Stat
+	runCommand                   = executeCommand
+	cmdLookPath                  = exec.LookPath
+	streamCommandOutput          = true
+	goEnv                        = defaultGoEnv
+	installCommunityTool         = communitytool.Install
+	installCommunityToolWithHome = communitytool.InstallWithHome
+	pathEnvEntries               = func(profile system.PlatformProfile) []string {
 		return splitPathForOS(os.Getenv("PATH"), profile.OS)
 	}
 	addUserPath         = system.AddToUserPath
@@ -175,6 +177,7 @@ func RunInstall(args []string, detection system.DetectionResult) (InstallResult,
 	if result.Execution.Err != nil {
 		return result, fmt.Errorf("execute install pipeline: %w", result.Execution.Err)
 	}
+	result.PiCodeGraph = runtime.state.piCodeGraph
 
 	result.Verify = runPostApplyVerification(postApplyVerificationInput{
 		HomeDir:      homeDir,
@@ -438,7 +441,8 @@ type installRuntime struct {
 }
 
 type runtimeState struct {
-	manifest backup.Manifest
+	manifest    backup.Manifest
+	piCodeGraph *communitytool.PiCodeGraphResult
 
 	// engramVersionResolved, engramVersion, and engramVersionErr cache the
 	// single `engram version` invocation performed by componentApplyStep.Run
@@ -512,7 +516,7 @@ func (r *installRuntime) stagePlan() pipeline.StagePlan {
 	}
 
 	for _, tool := range r.selection.CommunityTools {
-		apply = append(apply, communityToolInstallStep{id: "community-tool:" + string(tool), tool: tool, workspaceDir: r.workspaceDir})
+		apply = append(apply, communityToolInstallStep{id: "community-tool:" + string(tool), tool: tool, workspaceDir: r.workspaceDir, homeDir: r.homeDir})
 	}
 
 	for _, component := range r.resolved.OrderedComponents {
@@ -529,8 +533,31 @@ func (r *installRuntime) stagePlan() pipeline.StagePlan {
 			state:        r.state,
 		})
 	}
+	if containsAgent(r.resolved.Agents, model.AgentPi) {
+		selected := r.selection.HasCommunityTool(model.CommunityToolCodeGraph)
+		stepID := "community-tool:pi-codegraph-reconcile"
+		if !selected {
+			stepID = "community-tool:pi-codegraph-deselect"
+		}
+		apply = append(apply, piCodeGraphReconcileStep{id: stepID, homeDir: r.homeDir, workspaceDir: r.workspaceDir, selected: selected, state: r.state})
+	}
 
 	return pipeline.StagePlan{Prepare: prepare, Apply: apply}
+}
+
+type piCodeGraphReconcileStep struct {
+	id, homeDir, workspaceDir string
+	selected                  bool
+	state                     *runtimeState
+}
+
+func (s piCodeGraphReconcileStep) ID() string { return s.id }
+func (s piCodeGraphReconcileStep) Run() error {
+	result, err := communitytool.ReconcilePiCodeGraph(communitytool.PiCodeGraphOptions{HomeDir: s.homeDir, WorkspaceDir: s.workspaceDir, Selected: s.selected})
+	if err == nil && s.state != nil {
+		s.state.piCodeGraph = &result
+	}
+	return err
 }
 
 type prepareBackupStep struct {
@@ -715,12 +742,13 @@ type communityToolInstallStep struct {
 	id           string
 	tool         model.CommunityToolID
 	workspaceDir string
+	homeDir      string
 }
 
 func (s communityToolInstallStep) ID() string { return s.id }
 
 func (s communityToolInstallStep) Run() error {
-	_, err := installCommunityTool(s.tool, s.workspaceDir, communitytool.RunnerFunc(runCommand))
+	_, err := installCommunityToolWithHome(s.tool, s.workspaceDir, s.homeDir, communitytool.RunnerFunc(runCommand), communitytool.DetectorFunc(cmdLookPath))
 	if err != nil {
 		return fmt.Errorf("install community tool %q: %w", s.tool, err)
 	}
@@ -1287,6 +1315,11 @@ func backupTargets(homeDir, workspaceDir string, scope InstallScope, selection m
 
 	for _, component := range resolved.OrderedComponents {
 		for _, path := range componentPathsWithWorkspaceScoped(homeDir, workspaceDir, scope, selection, adapters, component) {
+			paths[path] = struct{}{}
+		}
+	}
+	if containsAgent(resolved.Agents, model.AgentPi) {
+		for _, path := range communitytool.PiCodeGraphPaths(homeDir, workspaceDir) {
 			paths[path] = struct{}{}
 		}
 	}

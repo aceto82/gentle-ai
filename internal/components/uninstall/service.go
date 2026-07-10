@@ -13,6 +13,7 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/agents"
 	"github.com/gentleman-programming/gentle-ai/internal/assets"
 	"github.com/gentleman-programming/gentle-ai/internal/backup"
+	"github.com/gentleman-programming/gentle-ai/internal/components/communitytool"
 	"github.com/gentleman-programming/gentle-ai/internal/components/filemerge"
 	"github.com/gentleman-programming/gentle-ai/internal/components/gga"
 	"github.com/gentleman-programming/gentle-ai/internal/components/sdd"
@@ -430,6 +431,14 @@ func (s *Service) executePlan(p plan, agentsToRemove []model.AgentID) (Result, e
 		return result, err
 	}
 	result.AgentsRemovedFromState = removed
+	if slices.Contains(agentsToRemove, model.AgentPi) {
+		piResult, piErr := communitytool.UninstallPiCodeGraph(s.homeDir)
+		if piErr != nil {
+			return result, fmt.Errorf("remove Pi CodeGraph integration: %w", piErr)
+		}
+		result.ChangedFiles = append(result.ChangedFiles, piResult.Files...)
+		result.ManualActions = append(result.ManualActions, piResult.ManualActions...)
+	}
 	result.ManualActions = dedupeSortedStrings(result.ManualActions)
 	return result, nil
 }

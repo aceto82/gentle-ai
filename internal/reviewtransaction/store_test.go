@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -32,17 +33,30 @@ func TestWriteAtomicPropagatesParentDirectorySyncFailure(t *testing.T) {
 }
 
 func TestWriteAtomicToleratesUnsupportedParentDirectorySync(t *testing.T) {
-	originalGOOS := reviewRuntimeGOOS
-	originalSync := syncReviewDirectory
-	reviewRuntimeGOOS = func() string { return "linux" }
-	syncReviewDirectory = func(string) error { return os.ErrInvalid }
-	t.Cleanup(func() {
-		reviewRuntimeGOOS = originalGOOS
-		syncReviewDirectory = originalSync
-	})
+	tests := []struct {
+		name string
+		goos string
+		err  error
+	}{
+		{name: "unix invalid operation", goos: "darwin", err: syscall.EINVAL},
+		{name: "unsupported filesystem", goos: "linux", err: errors.ErrUnsupported},
+		{name: "windows permission", goos: "windows", err: os.ErrPermission},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			originalGOOS := reviewRuntimeGOOS
+			originalSync := syncReviewDirectory
+			reviewRuntimeGOOS = func() string { return tt.goos }
+			syncReviewDirectory = func(string) error { return tt.err }
+			t.Cleanup(func() {
+				reviewRuntimeGOOS = originalGOOS
+				syncReviewDirectory = originalSync
+			})
 
-	if err := writeAtomic(filepath.Join(t.TempDir(), "state.json"), []byte("{}\n"), 0o644); err != nil {
-		t.Fatalf("writeAtomic() unsupported directory sync error = %v", err)
+			if err := writeAtomic(filepath.Join(t.TempDir(), "state.json"), []byte("{}\n"), 0o644); err != nil {
+				t.Fatalf("writeAtomic() unsupported directory sync error = %v", err)
+			}
+		})
 	}
 }
 

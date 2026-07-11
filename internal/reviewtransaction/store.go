@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"syscall"
 )
 
 const RecordSchema = "gentle-ai.review-record/v1"
@@ -839,7 +840,8 @@ func writeAtomic(path string, payload []byte, mode os.FileMode) error {
 	}
 	if err := syncReviewDirectory(filepath.Dir(path)); err != nil {
 		// NTFS and some filesystems do not support syncing directory handles.
-		unsupported := errors.Is(err, os.ErrInvalid) || reviewRuntimeGOOS() == "windows" && errors.Is(err, os.ErrPermission)
+		unsupported := errors.Is(err, syscall.EINVAL) || errors.Is(err, errors.ErrUnsupported) ||
+			reviewRuntimeGOOS() == "windows" && errors.Is(err, os.ErrPermission)
 		if !unsupported {
 			return fmt.Errorf("sync parent directory for %q: %w", path, err)
 		}

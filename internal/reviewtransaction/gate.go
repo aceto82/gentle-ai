@@ -144,6 +144,12 @@ func EvaluateNativeGate(ctx context.Context, repo string, receipt Receipt, reque
 	if !reflect.DeepEqual(authoritativeReceipt, receipt) {
 		return invalid("receipt does not match the authoritative transaction revision")
 	}
+	if request.Gate == GatePreCommit && request.Target.Kind != TargetCurrentChanges {
+		return invalid("pre-commit target must derive current repository changes")
+	}
+	if (request.Gate == GatePreCommit || request.Gate == GatePostApply && request.Target.Kind == TargetCurrentChanges) && !equalStrings(request.Target.IntendedUntracked, record.Transaction.Snapshot.IntendedUntracked) {
+		return invalid("current repository target does not retain the authoritative intended-untracked paths")
+	}
 	preimages, err := readGateArtifactPreimages(request)
 	if err != nil {
 		return invalid("persisted gate artifacts cannot be read: " + err.Error())
@@ -214,8 +220,9 @@ func EvaluateNativeGate(ctx context.Context, repo string, receipt Receipt, reque
 	if result == GateAllow {
 		finalGateAuthorizationHook()
 		finalSnapshot, finalRefs, err := buildLifecycleSnapshot(ctx, repo, request)
-		if err != nil || !reflect.DeepEqual(finalSnapshot, snapshot) || !sameResolvedPrePRRefs(finalRefs, resolvedPrePR) {
-			return invalid("repository target changed during final authorization")
+		finalChain, authorityErr := store.LoadChain()
+		if err != nil || authorityErr != nil || finalChain.HeadRevision != revision || finalChain.GenesisRevision != chain.GenesisRevision || finalChain.Identity != chain.Identity || !reflect.DeepEqual(finalSnapshot, snapshot) || !sameResolvedPrePRRefs(finalRefs, resolvedPrePR) {
+			return invalid("authority or repository target changed during final authorization")
 		}
 	}
 	return NativeGateEvaluation{Result: result, Reason: nativeGateReason(result), Context: gateContext}
@@ -233,7 +240,8 @@ func buildLifecycleSnapshot(ctx context.Context, repo string, request GateReques
 	if err != nil {
 		return Snapshot{}, nil, err
 	}
-	snapshot, err := (SnapshotBuilder{Repo: repo}).Build(ctx, target)
+	builder := SnapshotBuilder{Repo: repo}
+	snapshot, err := builder.build(ctx, target, request.Gate == GatePreCommit)
 	if err != nil || request.Gate != GatePrePR {
 		return snapshot, nil, err
 	}

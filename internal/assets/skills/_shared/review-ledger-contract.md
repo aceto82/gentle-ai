@@ -28,3 +28,5 @@ After ambiguous output, rerun the same facade operation; native discovery resume
 ## Delivery
 
 Repository Git common-dir CAS remains authoritative. Existing transaction, policy, ledger, receipt, bundle, and gate-context schemas, prerequisites, and compatibility behavior remain unchanged in this work unit. Reconcile mirrors only after native allow. Commit, push, PR, archive, incident, compatible-base, and release boundaries use `gentle-ai review validate --gate <gate> --cwd <repo>` to discover and validate the same receipt; they never launch reviewers or create a budget. Model/provider/profile selection remains user-owned.
+
+Before commit, stage all reviewed paths without content/mode changes, then validate pre-commit. Frozen intended-untracked paths must remain all untracked or all move to an index whose complete tree and paths match the receipt.

@@ -1,13 +1,161 @@
 package reviewtransaction
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestCompactPreCommitGatePreservesExactStagedIntendedTransition(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "tracked.txt", "reviewed tracked change\n")
+	intended := []string{"first.txt", "second.txt"}
+	for _, path := range intended {
+		writeSnapshotFile(t, repo, path, "reviewed "+path+"\n")
+	}
+	state, store, receipt := approvedCompactCurrentChangesFixture(t, repo, "compact-staged-intended", intended)
+	if got := EvaluateCompactGate(context.Background(), repo, receipt, NativeGateRequestInput{Gate: GatePostApply, LineageID: state.LineageID}); got.Result != GateAllow {
+		t.Fatalf("unstaged post-apply target = %#v", got)
+	}
+	gitSnapshot(t, repo, "add", "--", "tracked.txt", "first.txt", "second.txt")
+	if stagedTree := strings.TrimSpace(gitSnapshot(t, repo, "write-tree")); stagedTree != receipt.FinalCandidateTree {
+		t.Fatalf("staged tree = %s, want approved %s", stagedTree, receipt.FinalCandidateTree)
+	}
+	indexPath := strings.TrimSpace(gitSnapshot(t, repo, "rev-parse", "--git-path", "index"))
+	beforeIndex, err := os.ReadFile(filepath.Join(repo, indexPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeAuthority, err := os.ReadFile(store.StatePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeRecord, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := NativeGateRequestInput{Gate: GatePreCommit, LineageID: state.LineageID}
+	first := EvaluateCompactGate(context.Background(), repo, receipt, input)
+	second := EvaluateCompactGate(context.Background(), repo, receipt, input)
+	if first.Result != GateAllow || !reflect.DeepEqual(first, second) || first.Context.CandidateTree != receipt.FinalCandidateTree || first.Context.PathsDigest != receipt.PathsDigest {
+		t.Fatalf("deterministic staged transition = first %#v, second %#v", first, second)
+	}
+	afterIndex, _ := os.ReadFile(filepath.Join(repo, indexPath))
+	afterAuthority, _ := os.ReadFile(store.StatePath())
+	afterRecord, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(beforeIndex, afterIndex) || !bytes.Equal(beforeAuthority, afterAuthority) || beforeRecord.Revision != afterRecord.Revision || beforeRecord.State.CorrectionBudget != afterRecord.State.CorrectionBudget {
+		t.Fatal("pre-commit validation mutated the index, authority, lineage, or correction budget")
+	}
+
+	gitSnapshot(t, repo, "reset", "--", "tracked.txt", "first.txt", "second.txt")
+	if got := EvaluateCompactGate(context.Background(), repo, receipt, NativeGateRequestInput{Gate: GatePostApply, LineageID: state.LineageID}); got.Result != GateAllow {
+		t.Fatalf("restored unstaged post-apply target = %#v", got)
+	}
+}
+
+func TestCompactPreCommitGateRejectsInexactStagedIntendedTransitions(t *testing.T) {
+	tests := []struct {
+		name     string
+		prepare  func(t *testing.T, repo string)
+		mutate   func(t *testing.T, repo string)
+		override []string
+	}{
+		{name: "changed content", mutate: func(t *testing.T, repo string) {
+			writeSnapshotFile(t, repo, "first.txt", "changed after review\n")
+			gitSnapshot(t, repo, "add", "--", "first.txt", "second.txt")
+		}},
+		{name: "changed mode", mutate: func(t *testing.T, repo string) {
+			gitSnapshot(t, repo, "config", "core.filemode", "true")
+			if err := os.Chmod(filepath.Join(repo, "first.txt"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			gitSnapshot(t, repo, "add", "--", "first.txt", "second.txt")
+		}},
+		{name: "additional unreviewed staged path", mutate: func(t *testing.T, repo string) {
+			writeSnapshotFile(t, repo, "extra.txt", "not reviewed\n")
+			gitSnapshot(t, repo, "add", "--", "first.txt", "second.txt", "extra.txt")
+		}},
+		{name: "partial staging", mutate: func(t *testing.T, repo string) {
+			gitSnapshot(t, repo, "add", "--", "first.txt")
+		}},
+		{name: "reviewed tracked path left unstaged", prepare: func(t *testing.T, repo string) {
+			writeSnapshotFile(t, repo, "tracked.txt", "reviewed tracked change\n")
+		}, mutate: func(t *testing.T, repo string) {
+			gitSnapshot(t, repo, "add", "--", "first.txt", "second.txt")
+		}},
+		{name: "removed path", mutate: func(t *testing.T, repo string) {
+			if err := os.Remove(filepath.Join(repo, "first.txt")); err != nil {
+				t.Fatal(err)
+			}
+			gitSnapshot(t, repo, "add", "--", "second.txt")
+		}},
+		{name: "renamed path", mutate: func(t *testing.T, repo string) {
+			if err := os.Rename(filepath.Join(repo, "first.txt"), filepath.Join(repo, "renamed.txt")); err != nil {
+				t.Fatal(err)
+			}
+			gitSnapshot(t, repo, "add", "--", "second.txt", "renamed.txt")
+		}},
+		{name: "replaced path type", mutate: func(t *testing.T, repo string) {
+			if err := os.Remove(filepath.Join(repo, "first.txt")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("second.txt", filepath.Join(repo, "first.txt")); err != nil {
+				t.Fatal(err)
+			}
+			gitSnapshot(t, repo, "add", "--", "first.txt", "second.txt")
+		}},
+		{name: "caller drops frozen intended paths", mutate: func(t *testing.T, repo string) {
+			gitSnapshot(t, repo, "add", "--", "first.txt", "second.txt")
+		}, override: []string{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := initSnapshotRepo(t)
+			intended := []string{"first.txt", "second.txt"}
+			for _, path := range intended {
+				writeSnapshotFile(t, repo, path, "reviewed "+path+"\n")
+			}
+			if tt.prepare != nil {
+				tt.prepare(t, repo)
+			}
+			state, _, receipt := approvedCompactCurrentChangesFixture(t, repo, "compact-inexact-"+strings.ReplaceAll(tt.name, " ", "-"), intended)
+			tt.mutate(t, repo)
+			input := NativeGateRequestInput{Gate: GatePreCommit, LineageID: state.LineageID}
+			if tt.override != nil {
+				input.IntendedUntracked = tt.override
+			}
+			if got := EvaluateCompactGate(context.Background(), repo, receipt, input); got.Result == GateAllow {
+				t.Fatalf("inexact staged transition was allowed: %#v", got)
+			}
+		})
+	}
+}
+
+func TestCompactPreCommitGateRechecksStagedIntendedTarget(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "new.txt", "reviewed\n")
+	state, _, receipt := approvedCompactCurrentChangesFixture(t, repo, "compact-staged-recheck", []string{"new.txt"})
+	gitSnapshot(t, repo, "add", "--", "new.txt")
+	originalHook := finalGateAuthorizationHook
+	finalGateAuthorizationHook = func() {
+		writeSnapshotFile(t, repo, "new.txt", "changed during gate\n")
+		gitSnapshot(t, repo, "add", "--", "new.txt")
+	}
+	t.Cleanup(func() { finalGateAuthorizationHook = originalHook })
+
+	got := EvaluateCompactGate(context.Background(), repo, receipt, NativeGateRequestInput{Gate: GatePreCommit, LineageID: state.LineageID})
+	if got.Result != GateInvalidated || !strings.Contains(got.Reason, "changed during final authorization") {
+		t.Fatalf("staged intended TOCTOU evaluation = %#v", got)
+	}
+}
 
 func TestCompactReleaseGateUsesIndependentCompleteCurrentEvidence(t *testing.T) {
 	repo := initSnapshotRepo(t)
@@ -130,6 +278,44 @@ func approvedCompactRevisionFixture(t *testing.T, repo, lineage string) (Compact
 	t.Helper()
 	state := newCompactRevisionState(t, repo, lineage)
 	store, _ := CompactAuthoritativeStore(context.Background(), repo, lineage)
+	revision, err := store.Replace("", "review/start", state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := make([]LensResult, len(state.SelectedLenses))
+	for index, lens := range state.SelectedLenses {
+		results[index] = LensResult{Lens: lens, Findings: []Finding{}, Evidence: []string{"review completed"}}
+	}
+	if err := state.CompleteReview(CompactReviewInput{LensResults: results, Classifications: []FindingEvidence{}, RefuterOutcomes: []EvidenceResult{}}); err != nil {
+		t.Fatal(err)
+	}
+	revision, err = store.Replace(revision, "review/complete-review", state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.CompleteVerification([]byte("independent verification passed\n"), true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Replace(revision, "review/complete-verification", state); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := state.Receipt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteCompactReceiptAtomic(store.ReceiptPath(), receipt); err != nil {
+		t.Fatal(err)
+	}
+	return state, store, receipt
+}
+
+func approvedCompactCurrentChangesFixture(t *testing.T, repo, lineage string, intended []string) (CompactState, CompactStore, CompactReceipt) {
+	t.Helper()
+	state := newCompactTestStateWithIntended(t, repo, lineage, intended)
+	store, err := CompactAuthoritativeStore(context.Background(), repo, lineage)
+	if err != nil {
+		t.Fatal(err)
+	}
 	revision, err := store.Replace("", "review/start", state)
 	if err != nil {
 		t.Fatal(err)

@@ -48,7 +48,7 @@ These are orchestrator stop rules for solo-agent platforms. Once any trigger fir
 
 1. **4-file rule**: if understanding requires reading 4+ files, run an exploration/mapping phase before implementation.
 2. **Multi-file write rule**: if implementation will touch 2+ non-trivial files, require an explicit apply phase and verify phase boundary.
-3. **Lifecycle receipt rule**: before commit, push, PR, or release, run one native `gentle-ai review validate --gate <gate> --cwd <repo>` command for the same content-bound receipt; let the facade discover authority and artifacts, follow missing/scope-changed/invalidated/escalated action, and never launch a lens, Judgment Day, or new budget at the gate.
+3. **Lifecycle receipt rule**: before commit, stage every reviewed path without changing content or mode, then run native `gentle-ai review validate --gate pre-commit --cwd <repo>` for the same content-bound receipt; before push, PR, or release, run the corresponding native `gentle-ai review validate --gate <gate> --cwd <repo>`. Let the facade discover authority and artifacts, follow missing/scope-changed/invalidated/escalated action, and never launch a lens, Judgment Day, or new budget at the gate.
 4. **Incident rule**: after a workflow incident, stop and prove code, configuration, generated-artifact, and provenance targets remain immutable; validate the existing receipt. Any changed target requires explicit scope action, not reopened review.
 5. **Long-session rule**: after roughly 20 tool calls, 5 exploratory file reads, or 2 non-mechanical edits without a phase boundary and growing complexity, pause and re-plan instead of silently continuing monolithically.
 6. **Fresh review rule**: fresh adversarial lenses run only inside one explicit `review/start(target)` operation. Final verification checks requirements/runtime independently and never reopens the code review.
@@ -102,6 +102,8 @@ After ambiguous output, rerun the same facade operation; native discovery resume
 ## Delivery
 
 Repository Git common-dir CAS remains authoritative. Existing transaction, policy, ledger, receipt, bundle, and gate-context schemas, prerequisites, and compatibility behavior remain unchanged in this work unit. Reconcile mirrors only after native allow. Commit, push, PR, archive, incident, compatible-base, and release boundaries use `gentle-ai review validate --gate <gate> --cwd <repo>` to discover and validate the same receipt; they never launch reviewers or create a budget. Model/provider/profile selection remains user-owned.
+
+Before commit, stage all reviewed paths without content/mode changes, then validate pre-commit. Frozen intended-untracked paths must remain all untracked or all move to an index whose complete tree and paths match the receipt.
 
 #### Cost and Context Balance
 

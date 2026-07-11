@@ -90,6 +90,37 @@ func TestSnapshotBuilderCurrentChangesIsCompleteAndPreservesRealIndex(t *testing
 	}
 }
 
+func TestPreCommitSnapshotAllowsOnlyCompleteStagedIntendedTransition(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	intended := []string{"first.txt", "second.txt"}
+	for _, path := range intended {
+		writeSnapshotFile(t, repo, path, "reviewed "+path+"\n")
+	}
+	target := Target{Kind: TargetCurrentChanges, IntendedUntracked: intended}
+	builder := SnapshotBuilder{Repo: repo}
+	want, err := builder.Build(context.Background(), target)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gitSnapshot(t, repo, "add", "--", "first.txt")
+	if _, err := builder.build(context.Background(), target, true); err == nil || !strings.Contains(err.Error(), "all untracked or all staged") {
+		t.Fatalf("partial staged transition error = %v", err)
+	}
+
+	gitSnapshot(t, repo, "add", "--", "second.txt")
+	got, err := builder.build(context.Background(), target, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("staged transition changed snapshot:\nwant=%#v\ngot=%#v", want, got)
+	}
+	if _, err := builder.Build(context.Background(), target); err == nil || !strings.Contains(err.Error(), "already tracked") {
+		t.Fatalf("ordinary snapshot derivation accepted staged intended paths: %v", err)
+	}
+}
+
 func TestSnapshotDiffStatsExcludeGeneratedGoldensOnlyFromAuthoredLines(t *testing.T) {
 	repo := initSnapshotRepo(t)
 	writeSnapshotFile(t, repo, "tracked.txt", "candidate\n")

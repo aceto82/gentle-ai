@@ -758,6 +758,43 @@ func TestNativeGateFinalRecheckRejectsConcurrentRepositoryMutation(t *testing.T)
 	}
 }
 
+func TestNativeGateFinalRecheckRejectsConcurrentAuthorityMutation(t *testing.T) {
+	repo, receipt, request := approvedCurrentChangesGateFixture(t, "final-authority-recheck")
+	store, err := AuthoritativeStore(context.Background(), repo, receipt.LineageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalHook := finalGateAuthorizationHook
+	finalGateAuthorizationHook = func() {
+		if err := os.WriteFile(filepath.Join(store.Dir, "HEAD"), []byte(hash("f")+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { finalGateAuthorizationHook = originalHook })
+
+	if got := EvaluateNativeGate(context.Background(), repo, receipt, request); got.Result != GateInvalidated || !strings.Contains(got.Reason, "changed during final authorization") {
+		t.Fatalf("concurrent authority evaluation = %#v", got)
+	}
+}
+
+func TestLegacyPreCommitGateAcceptsExactStagedIntendedTransition(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "new.txt", "reviewed new file\n")
+	transaction, receipt, request := nativeGateFixtureWithIntended(t, repo, "legacy-staged-intended", []string{"new.txt"})
+	store, err := AuthoritativeStore(context.Background(), repo, transaction.LineageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendApprovedStoreChain(t, store, transaction)
+	bindGateRequestToStore(t, &request, store)
+	request.Gate = GatePreCommit
+	gitSnapshot(t, repo, "add", "--", "new.txt")
+
+	if got := EvaluateNativeGate(context.Background(), repo, receipt, request); got.Result != GateAllow {
+		t.Fatalf("legacy staged intended transition = %#v", got)
+	}
+}
+
 func TestNativeGateRejectsForgedStandaloneTerminalHead(t *testing.T) {
 	repo := initSnapshotRepo(t)
 	tx, receipt, request := nativeGateFixture(t, repo, "forged-terminal-lineage")
@@ -803,6 +840,10 @@ func TestNativeGateCannotBeInfluencedByAlternateStore(t *testing.T) {
 }
 
 func nativeGateFixture(t *testing.T, repo, lineage string) (Transaction, Receipt, GateRequest) {
+	return nativeGateFixtureWithIntended(t, repo, lineage, []string{})
+}
+
+func nativeGateFixtureWithIntended(t *testing.T, repo, lineage string, intended []string) (Transaction, Receipt, GateRequest) {
 	t.Helper()
 	dir := t.TempDir()
 	policyPath := filepath.Join(dir, "policy.md")
@@ -817,7 +858,7 @@ func nativeGateFixture(t *testing.T, repo, lineage string) (Transaction, Receipt
 			t.Fatal(err)
 		}
 	}
-	snapshot, err := (SnapshotBuilder{Repo: repo}).Build(context.Background(), Target{Kind: TargetCurrentChanges, IntendedUntracked: []string{}})
+	snapshot, err := (SnapshotBuilder{Repo: repo}).Build(context.Background(), Target{Kind: TargetCurrentChanges, IntendedUntracked: intended})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -854,7 +895,7 @@ func nativeGateFixture(t *testing.T, repo, lineage string) (Transaction, Receipt
 	return *tx, receipt, GateRequest{
 		Schema:           GateRequestSchema,
 		Gate:             GatePostApply,
-		Target:           Target{Kind: TargetCurrentChanges, IntendedUntracked: []string{}},
+		Target:           Target{Kind: TargetCurrentChanges, IntendedUntracked: append([]string{}, intended...)},
 		PolicyArtifact:   policyPath,
 		LedgerArtifact:   ledgerPath,
 		EvidenceArtifact: evidencePath,

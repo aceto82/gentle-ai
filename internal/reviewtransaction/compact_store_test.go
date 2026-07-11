@@ -404,8 +404,12 @@ func authorityFileMetrics(t *testing.T, root string) (int, int64) {
 }
 
 func newCompactTestState(t *testing.T, repo, lineage string) CompactState {
+	return newCompactTestStateWithIntended(t, repo, lineage, []string{})
+}
+
+func newCompactTestStateWithIntended(t *testing.T, repo, lineage string, intended []string) CompactState {
 	t.Helper()
-	snapshot, err := (SnapshotBuilder{Repo: repo}).Build(context.Background(), Target{Kind: TargetCurrentChanges, IntendedUntracked: []string{}})
+	snapshot, err := (SnapshotBuilder{Repo: repo}).Build(context.Background(), Target{Kind: TargetCurrentChanges, IntendedUntracked: intended})
 	if err != nil {
 		t.Fatal(err)
 	}

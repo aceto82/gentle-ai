@@ -38,6 +38,9 @@ func EvaluateCompactGate(ctx context.Context, repo string, receipt CompactReceip
 	if err != nil {
 		return invalid("compact gate inputs cannot be derived: " + err.Error())
 	}
+	if (request.Gate == GatePostApply || request.Gate == GatePreCommit) && !equalStrings(request.Target.IntendedUntracked, record.State.CurrentSnapshot.IntendedUntracked) {
+		return invalid("current repository target does not retain the authoritative intended-untracked paths")
+	}
 	preimages, err := readGateArtifactPreimages(request)
 	if err != nil {
 		return invalid("compact gate evidence cannot be read: " + err.Error())
@@ -108,7 +111,7 @@ func buildCompactGateRequest(ctx context.Context, repo string, state CompactStat
 	case GatePostApply, GatePreCommit:
 		intended := input.IntendedUntracked
 		if intended == nil {
-			intended = append([]string(nil), state.InitialSnapshot.IntendedUntracked...)
+			intended = append([]string(nil), state.CurrentSnapshot.IntendedUntracked...)
 		}
 		request.Target = Target{Kind: TargetCurrentChanges, IntendedUntracked: intended}
 	case GatePrePush:

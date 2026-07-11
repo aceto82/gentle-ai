@@ -45,7 +45,11 @@ func TestOrchestratorsRequireNonSkippableGeneralDelegationTriggers(t *testing.T)
 
 		lifecycleLine := markdownLineContaining(triggerSection, "**Lifecycle receipt rule**")
 		if !lineContainsAll(
-			"before commit, push, PR, or release",
+			"before commit",
+			"stage every reviewed path",
+			"without changing content or mode",
+			"gentle-ai review validate --gate pre-commit --cwd <repo>",
+			"before push, PR, or release",
 			"content-bound receipt",
 			"gentle-ai review validate --gate <gate> --cwd <repo>",
 			"facade discover authority and artifacts",
@@ -1605,13 +1609,17 @@ func boundedReviewRoutingProblems(content string) []string {
 		{
 			label: "Lifecycle receipt rule",
 			matcher: lineContainsAll(
-				"before commit, push, PR, or release",
+				"before commit",
+				"before push, PR, or release",
 				"content-bound receipt",
+				"gentle-ai review validate --gate pre-commit --cwd <repo>",
 				"gentle-ai review validate --gate <gate> --cwd <repo>",
 				"facade discover authority and artifacts",
 				"never launch a lens",
 				"Judgment Day",
 				"new budget at the gate",
+				"stage every reviewed path",
+				"without changing content or mode",
 			),
 			contract: "must validate the content-bound receipt without launching a lens, Judgment Day, or a new budget",
 		},

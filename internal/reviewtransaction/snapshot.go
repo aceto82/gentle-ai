@@ -52,6 +52,10 @@ type SnapshotBuilder struct {
 var exactObjectPattern = regexp.MustCompile(`^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$`)
 
 func (builder SnapshotBuilder) Build(ctx context.Context, target Target) (Snapshot, error) {
+	return builder.build(ctx, target, false)
+}
+
+func (builder SnapshotBuilder) build(ctx context.Context, target Target, allowStagedIntended bool) (Snapshot, error) {
 	repo, err := builder.repositoryRoot(ctx)
 	if err != nil {
 		return Snapshot{}, err
@@ -74,7 +78,7 @@ func (builder SnapshotBuilder) Build(ctx context.Context, target Target) (Snapsh
 		if err != nil {
 			return Snapshot{}, err
 		}
-		baseTree, candidateTree, untrackedProof, err = builder.buildCurrentChanges(ctx, intended)
+		baseTree, candidateTree, untrackedProof, err = builder.buildCurrentChanges(ctx, intended, allowStagedIntended)
 	case TargetBaseDiff:
 		if strings.TrimSpace(target.BaseRef) == "" {
 			return Snapshot{}, errors.New("base-diff requires base_ref")
@@ -98,7 +102,7 @@ func (builder SnapshotBuilder) Build(ctx context.Context, target Target) (Snapsh
 		if err != nil {
 			return Snapshot{}, err
 		}
-		_, candidateTree, untrackedProof, err = builder.buildCurrentChanges(ctx, intended)
+		_, candidateTree, untrackedProof, err = builder.buildCurrentChanges(ctx, intended, false)
 		if err == nil {
 			baseTree, err = builder.resolveTree(ctx, target.BaseRef)
 		}
@@ -272,7 +276,7 @@ func canonicalRepositoryPath(path string) (string, error) {
 	return filepath.Clean(resolved), nil
 }
 
-func (builder SnapshotBuilder) buildCurrentChanges(ctx context.Context, intended []string) (string, string, string, error) {
+func (builder SnapshotBuilder) buildCurrentChanges(ctx context.Context, intended []string, allowStagedIntended bool) (string, string, string, error) {
 	baseTree, err := builder.resolveTree(ctx, "HEAD")
 	if err != nil {
 		return "", "", "", err
@@ -290,9 +294,13 @@ func (builder SnapshotBuilder) buildCurrentChanges(ctx context.Context, intended
 		return "", "", "", fmt.Errorf("read real index: %w", err)
 	}
 
+	stagedIntended := 0
 	for _, logicalPath := range intended {
 		if _, err := runGit(ctx, builder.Repo, nil, nil, "ls-files", "--error-unmatch", "--", logicalPath); err == nil {
-			return "", "", "", fmt.Errorf("intended-untracked path %q is already tracked", logicalPath)
+			if !allowStagedIntended {
+				return "", "", "", fmt.Errorf("intended-untracked path %q is already tracked", logicalPath)
+			}
+			stagedIntended++
 		}
 		info, err := os.Lstat(filepath.Join(builder.Repo, filepath.FromSlash(logicalPath)))
 		if err != nil {
@@ -301,6 +309,9 @@ func (builder SnapshotBuilder) buildCurrentChanges(ctx context.Context, intended
 		if info.IsDir() {
 			return "", "", "", fmt.Errorf("intended-untracked path %q must name a file or symlink, not a directory", logicalPath)
 		}
+	}
+	if stagedIntended > 0 && stagedIntended != len(intended) {
+		return "", "", "", errors.New("intended-untracked paths must be either all untracked or all staged")
 	}
 
 	temp, err := os.CreateTemp("", "gentle-ai-review-index-*")
@@ -330,6 +341,11 @@ func (builder SnapshotBuilder) buildCurrentChanges(ctx context.Context, intended
 		return "", "", "", err
 	}
 	candidateTree := strings.TrimSpace(string(candidateOutput))
+	if stagedIntended > 0 {
+		if _, err := runGit(ctx, builder.Repo, nil, nil, "diff", "--cached", "--quiet", candidateTree, "--"); err != nil {
+			return "", "", "", errors.New("staged tree does not exactly match the complete reviewed candidate")
+		}
+	}
 	proof, err := builder.untrackedProof(ctx, candidateTree, intended)
 	if err != nil {
 		return "", "", "", err

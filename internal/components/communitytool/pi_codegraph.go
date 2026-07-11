@@ -265,11 +265,15 @@ func ReconcilePiCodeGraph(options PiCodeGraphOptions) (result PiCodeGraphResult,
 		}
 	}
 	if err = verifyPiCodeGraphWithProbe(effectiveMCPPath, result.Children, probe); err != nil {
-		return result, err
-	}
-	result.MCP, err = verifyPiMCPWithProbe(effectiveMCPPath, probe)
-	if err != nil {
-		return result, err
+		result, err = PreservePiCodeGraphPending(result, err)
+		if err != nil {
+			return result, err
+		}
+	} else {
+		result.MCP, err = verifyPiMCPWithProbe(effectiveMCPPath, probe)
+		if err != nil {
+			return result, err
+		}
 	}
 	encoded, marshalErr := json.MarshalIndent(manifest, "", "  ")
 	if marshalErr != nil {

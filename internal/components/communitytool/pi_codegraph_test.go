@@ -471,6 +471,34 @@ func TestPiCodeGraphFailureRemovesNewPackageOverlayWithoutVerificationSuccess(t 
 	}
 }
 
+func TestPiCodeGraphPendingProbePreservesConfiguredFiles(t *testing.T) {
+	home := t.TempDir()
+	mcpPath := filepath.Join(home, ".pi", "agent", "mcp.json")
+	childPath := filepath.Join(home, ".pi", "agent", "subagents", "worker.md")
+	manifestPath := filepath.Join(home, ".gentle-ai", "pi-codegraph.json")
+	writePiFile(t, childPath, "---\ntools: bash\n---\nwork\n")
+	pendingProbe := func(string) (PiCodeGraphMCPProbeResult, error) {
+		return PiCodeGraphMCPProbeResult{}, ErrPiCodeGraphAdapterHealthUnavailable
+	}
+
+	result, err := ReconcilePiCodeGraph(PiCodeGraphOptions{HomeDir: home, Selected: true, EffectiveMCPProbe: pendingProbe})
+	if err != nil {
+		t.Fatalf("ReconcilePiCodeGraph() error = %v, want pending success", err)
+	}
+	if len(result.ManualActions) != 1 || !strings.Contains(result.ManualActions[0], "pending") {
+		t.Fatalf("ManualActions = %#v, want one pending action", result.ManualActions)
+	}
+	if got := string(mustReadPiFile(t, mcpPath)); !strings.Contains(got, `"codegraph"`) {
+		t.Fatalf("pending MCP config = %s, want preserved CodeGraph server", got)
+	}
+	if got := string(mustReadPiFile(t, childPath)); !strings.Contains(got, piCodeGraphGuidanceMarker) {
+		t.Fatalf("pending child = %q, want preserved CodeGraph guidance", got)
+	}
+	if _, err := os.Stat(manifestPath); err != nil {
+		t.Fatalf("pending manifest was not persisted: %v", err)
+	}
+}
+
 func TestPiCodeGraphUninstallRollsBackWhenManifestRemovalFails(t *testing.T) {
 	home := t.TempDir()
 	mcpPath := filepath.Join(home, ".pi", "agent", "mcp.json")

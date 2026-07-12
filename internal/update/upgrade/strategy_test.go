@@ -3,8 +3,7 @@ package upgrade
 import (
 	"context"
 	"errors"
-	"github.com/gentleman-programming/gentle-ai/internal/system"
-	"github.com/gentleman-programming/gentle-ai/internal/update"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +12,9 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/gentleman-programming/gentle-ai/internal/system"
+	"github.com/gentleman-programming/gentle-ai/internal/update"
 )
 
 func TestMain(m *testing.M) {
@@ -688,6 +690,153 @@ func TestRunStrategyOpenCodePluginRegisteredPendingRunsPackageManager(t *testing
 	if strings.Join(gotArgs, " ") != strings.Join(wantArgs, " ") {
 		t.Fatalf("exec args = %v, want %v", gotArgs, wantArgs)
 	}
+}
+
+func TestRunStrategyOpenCodePluginNpmERESOLVERetriesWithLegacyPeerDeps(t *testing.T) {
+	var callHistory [][]string
+	configureOpenCodeNpmTest(t, func(name string, args ...string) *exec.Cmd {
+		callHistory = append(callHistory, append([]string{name}, args...))
+		if len(callHistory) == 1 {
+			return failingCmd("npm error code ERESOLVE\nnpm error ERESOLVE could not resolve")
+		}
+		return mockCmd("true")
+	})
+
+	readStderr, writeStderr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	origStderr := os.Stderr
+	os.Stderr = writeStderr
+	t.Cleanup(func() { os.Stderr = origStderr })
+
+	_, upgradeErr := runStrategy(context.Background(), openCodePluginUpdateResult("opencode-sdd-engram-manage"), system.PlatformProfile{})
+	os.Stderr = origStderr
+	if err := writeStderr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	warning, err := io.ReadAll(readStderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := readStderr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if upgradeErr != nil {
+		t.Fatalf("unexpected error on retry: %v", upgradeErr)
+	}
+	if !strings.Contains(string(warning), "WARNING:") || !strings.Contains(string(warning), "--legacy-peer-deps") {
+		t.Fatalf("stderr = %q, want visible legacy peer dependency warning", warning)
+	}
+	if len(callHistory) != 2 {
+		t.Fatalf("expected 2 exec calls (initial + retry), got %d", len(callHistory))
+	}
+	wantRetry := []string{"npm", "install", "--save", "--no-audit", "--no-fund", "--legacy-peer-deps", "opencode-sdd-engram-manage@latest", "@opencode-ai/plugin@latest"}
+	if strings.Join(callHistory[1], " ") != strings.Join(wantRetry, " ") {
+		t.Fatalf("retry command = %v, want %v", callHistory[1], wantRetry)
+	}
+}
+
+func TestRunStrategyOpenCodePluginNpmERESOLVERetryFailurePreservesBothErrors(t *testing.T) {
+	configureOpenCodeNpmTest(t, func(name string, args ...string) *exec.Cmd {
+		if slicesContain(args, "--legacy-peer-deps") {
+			return failingCmd("retry failed")
+		}
+		return failingCmd("npm error code ERESOLVE\noriginal conflict")
+	})
+
+	_, err := runStrategy(context.Background(), openCodePluginUpdateResult("opencode-sdd-engram-manage"), system.PlatformProfile{})
+	if err == nil {
+		t.Fatal("expected retry failure")
+	}
+	for _, want := range []string{"retry failed", "original conflict", "original error", "retry with --legacy-peer-deps failed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
+	}
+}
+
+func TestRunStrategyOpenCodePluginNpmNonERESOLVEDoesNotRetry(t *testing.T) {
+	calls := 0
+	configureOpenCodeNpmTest(t, func(name string, args ...string) *exec.Cmd {
+		calls++
+		return failingCmd("npm error package code ERESOLVE helper failed")
+	})
+
+	_, err := runStrategy(context.Background(), openCodePluginUpdateResult("opencode-sdd-engram-manage"), system.PlatformProfile{})
+	if err == nil {
+		t.Fatal("expected npm failure")
+	}
+	if calls != 1 {
+		t.Fatalf("exec calls = %d, want 1 without retry", calls)
+	}
+}
+
+func TestRunStrategyOpenCodePluginNpmERESOLVEDoesNotRetryAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var callHistory [][]string
+	configureOpenCodeNpmTest(t, func(name string, args ...string) *exec.Cmd {
+		callHistory = append(callHistory, append([]string{name}, args...))
+		cancel()
+		return failingCmd("npm error code ERESOLVE")
+	})
+
+	_, err := runStrategy(ctx, openCodePluginUpdateResult("opencode-sdd-engram-manage"), system.PlatformProfile{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if len(callHistory) != 1 {
+		t.Fatalf("exec calls = %d, want 1 without retry", len(callHistory))
+	}
+	if slicesContain(callHistory[0], "--legacy-peer-deps") {
+		t.Fatalf("initial command unexpectedly includes --legacy-peer-deps: %v", callHistory[0])
+	}
+}
+
+func configureOpenCodeNpmTest(t *testing.T, command func(string, ...string) *exec.Cmd) {
+	t.Helper()
+	origHomeDir, origLookPath, origExecCommand := openCodeHomeDir, lookPathCommand, execCommand
+	t.Cleanup(func() {
+		openCodeHomeDir, lookPathCommand, execCommand = origHomeDir, origLookPath, origExecCommand
+	})
+	home := t.TempDir()
+	opencodeDir := filepath.Join(home, ".config", "opencode")
+	if err := os.MkdirAll(opencodeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(opencodeDir, "tui.json"), []byte(`{"plugin":["opencode-sdd-engram-manage"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	openCodeHomeDir = func() (string, error) { return home, nil }
+	lookPathCommand = func(file string) (string, error) {
+		if file == "npm" {
+			return file, nil
+		}
+		return "", errors.New("not found")
+	}
+	execCommand = command
+}
+
+func openCodePluginUpdateResult(pkg string) update.UpdateResult {
+	return update.UpdateResult{Tool: update.ToolInfo{Name: pkg, InstallMethod: update.InstallOpenCodePlugin, NpmPackage: pkg}, Status: update.RegisteredNotMaterialized}
+}
+
+func slicesContain(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func failingCmd(output string) *exec.Cmd {
+	if runtime.GOOS == "windows" {
+		return exec.Command("cmd", "/c", "echo "+strings.ReplaceAll(output, "\n", " & echo ")+" & exit /b 1")
+	}
+	return exec.Command("sh", "-c", "printf '%s\\n' \"$1\"; exit 1", "sh", output)
 }
 
 func TestRunStrategyOpenCodePluginFallsBackWithoutPackageManager(t *testing.T) {

@@ -162,12 +162,39 @@ func opencodePluginUpgrade(ctx context.Context, r update.UpdateResult) error {
 	cmd.Stdin = nil
 	cmd.Env = openCodePluginUpgradeEnv(cmd.Env)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("%s upgrade %s in %s: %w (output: %s)", pm, pkg, opencodeDir, err, string(out))
+		outStr := string(out)
+		if pm == "npm" && npmErrorCode(outStr) == "ERESOLVE" {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+			fmt.Fprintln(os.Stderr, "WARNING: npm reported an ERESOLVE peer dependency conflict; retrying with --legacy-peer-deps")
+			retryCmd := execCommand("npm", append([]string{"install", "--save", "--no-audit", "--no-fund", "--legacy-peer-deps"}, targets...)...)
+			retryCmd.Dir = opencodeDir
+			retryCmd.Stdin = nil
+			retryCmd.Env = openCodePluginUpgradeEnv(retryCmd.Env)
+			if retryOut, retryErr := retryCmd.CombinedOutput(); retryErr != nil {
+				return fmt.Errorf("%s upgrade %s in %s: retry with --legacy-peer-deps failed: %w (retry output: %s); original error: %v (original output: %s)", pm, pkg, opencodeDir, retryErr, string(retryOut), err, outStr)
+			}
+		} else {
+			return fmt.Errorf("%s upgrade %s in %s: %w (output: %s)", pm, pkg, opencodeDir, err, outStr)
+		}
 	}
 	if err := clearOpenCodePluginPackageCache(homeDir, pkg); err != nil {
 		return fmt.Errorf("clear OpenCode package cache for %s: %w", pkg, err)
 	}
 	return nil
+}
+
+func npmErrorCode(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 4 && fields[0] == "npm" && fields[1] == "error" && fields[2] == "code" {
+			return fields[3]
+		}
+	}
+	return ""
 }
 
 func openCodePluginRegisteredOrMaterialized(opencodeDir, pkg string) (bool, bool, error) {

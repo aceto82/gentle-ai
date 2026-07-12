@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/gentleman-programming/gentle-ai/internal/reviewtransaction"
+	"github.com/gentleman-programming/gentle-ai/internal/sddstatus"
 )
 
 func TestReviewFacadeCleanFlowReplacesOneCompactStateAndUsesOnlyReceipt(t *testing.T) {
@@ -507,6 +508,88 @@ func TestReviewFacadeHelpAndFlatCompatibilityPathsRemainAvailable(t *testing.T) 
 		if err := test.run([]string{"--help"}, &output); err != nil || !strings.Contains(output.String(), test.want) {
 			t.Fatalf("flat compatibility help %q: %v\n%s", test.want, err, output.String())
 		}
+	}
+}
+
+func TestReviewBindSDDRequiresExplicitInputs(t *testing.T) {
+	err := RunReview([]string{"bind-sdd", "--cwd", t.TempDir(), "--change", "thin", "--lineage", "approved"}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "expected-binding-revision") {
+		t.Fatalf("bind-sdd missing explicit CAS input error = %v", err)
+	}
+}
+
+func TestReviewBindSDDAcceptsEqualsFormForEmptyExpectedRevision(t *testing.T) {
+	repo := initReviewCLIRepo(t)
+	change := filepath.Join(repo, "openspec", "changes", "thin")
+	for path, content := range map[string]string{"tasks.md": "- [x] 1.1 Done\n", "proposal.md": "# Proposal\n", "design.md": "# Design\n", "specs/binding/spec.md": "# Spec\n"} {
+		fullPath := filepath.Join(change, path)
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	started := startFacadeReview(t, repo)
+	evidence := filepath.Join(t.TempDir(), "evidence.txt")
+	if err := os.WriteFile(evidence, []byte("tests pass\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := RunReviewFacadeFinalize([]string{"--cwd", repo, "--lineage", started.LineageID, "--evidence", evidence}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if err := RunReview([]string{"bind-sdd", "--cwd", repo, "--change", "thin", "--lineage", started.LineageID, "--expected-binding-revision="}, io.Discard); err != nil {
+		t.Fatalf("equals-form expected revision was rejected: %v", err)
+	}
+}
+
+func TestReviewBindSDDFeedsSelectedSDDStatusRuntime(t *testing.T) {
+	repo := initReviewCLIRepo(t)
+	change := filepath.Join(repo, "openspec", "changes", "thin")
+	if err := os.MkdirAll(change, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(change, "tasks.md"), []byte("- [x] 1.1 Done\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for path, content := range map[string]string{
+		"proposal.md":           "# Proposal\n",
+		"design.md":             "# Design\n",
+		"specs/binding/spec.md": "# Spec\n",
+	} {
+		fullPath := filepath.Join(change, path)
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	started := startFacadeReview(t, repo)
+	evidence := filepath.Join(t.TempDir(), "evidence.txt")
+	if err := os.WriteFile(evidence, []byte("tests pass\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := RunReviewFacadeFinalize([]string{"--cwd", repo, "--lineage", started.LineageID, "--evidence", evidence}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := RunReview([]string{"bind-sdd", "--cwd", repo, "--change", "thin", "--lineage", started.LineageID, "--expected-binding-revision", ""}, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "gentle-ai.sdd-review-binding/v1") {
+		t.Fatalf("binding output = %s", output.String())
+	}
+	output.Reset()
+	if err := RunSDDStatus([]string{"thin", "--cwd", repo, "--json"}, &output); err != nil {
+		t.Fatal(err)
+	}
+	var status sddstatus.Status
+	if err := json.Unmarshal(output.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.NextRecommended != "verify" || status.Dependencies.Verify != sddstatus.DependencyReady || status.Dependencies.Archive != sddstatus.DependencyBlocked || status.ReviewGate == nil || status.ReviewGate.Result != reviewtransaction.GateAllow {
+		t.Fatalf("bound runtime status = %#v", status)
 	}
 }
 

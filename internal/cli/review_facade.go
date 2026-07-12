@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/gentleman-programming/gentle-ai/internal/reviewtransaction"
+	"github.com/gentleman-programming/gentle-ai/internal/sddstatus"
 )
 
 const facadeReviewPolicy = `Gentle AI native bounded review policy.
@@ -92,7 +93,7 @@ type facadeArtifacts struct {
 
 func RunReview(args []string, stdout io.Writer) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
-		_, _ = fmt.Fprintln(stdout, "Usage: gentle-ai review <start|finalize|validate|invalidate> [flags]\n\nOrdinary review facade; repository scope, authority, canonical artifacts, and lifecycle transitions are derived by Go.")
+		_, _ = fmt.Fprintln(stdout, "Usage: gentle-ai review <start|finalize|validate|invalidate|bind-sdd> [flags]\n\nOrdinary review facade; repository scope, authority, canonical artifacts, and lifecycle transitions are derived by Go.")
 		return nil
 	}
 	switch args[0] {
@@ -104,9 +105,40 @@ func RunReview(args []string, stdout io.Writer) error {
 		return RunReviewFacadeValidate(args[1:], stdout)
 	case "invalidate":
 		return RunReviewInvalidate(args[1:], stdout)
+	case "bind-sdd":
+		return RunReviewBindSDD(args[1:], stdout)
 	default:
 		return fmt.Errorf("unknown review command %q", args[0])
 	}
+}
+
+func RunReviewBindSDD(args []string, stdout io.Writer) error {
+	flags := newReviewFlagSet("review bind-sdd", stdout, "Bind an explicit approved compact lineage to an OpenSpec change.")
+	cwd := flags.String("cwd", "", "repository path")
+	change := flags.String("change", "", "OpenSpec change")
+	lineage := flags.String("lineage", "", "approved lineage")
+	expected := flags.String("expected-binding-revision", "", "binding revision")
+	if err := parseReviewFlags(flags, args); err != nil {
+		return err
+	}
+	if reviewHelpRequested(args) {
+		return nil
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected review bind-sdd argument %q", flags.Arg(0))
+	}
+	hasExpected := false
+	for _, arg := range args {
+		hasExpected = hasExpected || arg == "--expected-binding-revision" || strings.HasPrefix(arg, "--expected-binding-revision=")
+	}
+	if strings.TrimSpace(*cwd) == "" || strings.TrimSpace(*change) == "" || strings.TrimSpace(*lineage) == "" || !hasExpected {
+		return errors.New("review bind-sdd requires --cwd, --change, --lineage, and --expected-binding-revision")
+	}
+	binding, err := sddstatus.BindApprovedReview(context.Background(), *cwd, *change, *lineage, *expected)
+	if err != nil {
+		return err
+	}
+	return encodeReviewJSON(stdout, binding)
 }
 
 func RunReviewInvalidate(args []string, stdout io.Writer) error {

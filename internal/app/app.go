@@ -537,7 +537,7 @@ func tuiExecute(
 			agentIDs = append(agentIDs, string(a))
 		}
 		claudePhaseState := claudePhaseAssignmentsToState(selection.ClaudePhaseAssignments)
-		if writeErr := state.Write(homeDir, state.InstallState{
+		installState := state.InstallState{
 			InstalledAgents:             agentIDs,
 			CommunityTools:              appCommunityToolIDsToStrings(selection.CommunityTools),
 			CommunityToolsConfigured:    true,
@@ -550,7 +550,9 @@ func tuiExecute(
 			CodexPhaseModelAssignments:  selection.CodexPhaseModelAssignments,
 			ModelAssignments:            modelAssignmentsToState(selection.ModelAssignments),
 			Persona:                     string(selection.Persona),
-		}); writeErr != nil {
+		}
+		installState.SetSelection(selection)
+		if writeErr := state.Write(homeDir, installState); writeErr != nil {
 			execResult.Err = fmt.Errorf("persist install state: %w", writeErr)
 		}
 	}
@@ -667,6 +669,12 @@ func syncShouldIncludePermissions(agentIDs []model.AgentID) bool {
 }
 
 func syncArgsForDiscoveredAgents(homeDir string) []string {
+	if persisted, err := state.Read(homeDir); err == nil && persisted.SelectionConfigured {
+		if (model.Selection{Components: persisted.Components}).HasComponent(model.ComponentPermission) {
+			return []string{"--include-permissions"}
+		}
+		return nil
+	}
 	if syncShouldIncludePermissions(cli.DiscoverAgents(homeDir)) {
 		return []string{"--include-permissions"}
 	}
@@ -737,6 +745,7 @@ func loadPersistedAssignments(homeDir string, selection *model.Selection) {
 	if err != nil {
 		return
 	}
+	cli.RestorePersistedSelection(selection, s, cli.SyncFlags{})
 	if len(selection.ClaudePhaseAssignments) == 0 && len(s.ClaudePhaseAssignments) > 0 {
 		m := make(map[string]model.ClaudePhaseAssignment, len(s.ClaudePhaseAssignments))
 		for k, v := range s.ClaudePhaseAssignments {

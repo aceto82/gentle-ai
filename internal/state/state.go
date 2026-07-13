@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gentleman-programming/gentle-ai/internal/components/filemerge"
+	"github.com/gentleman-programming/gentle-ai/internal/model"
 )
 
 const stateDir = ".gentle-ai"
@@ -38,7 +39,13 @@ type ClaudePhaseAssignmentState struct {
 
 // InstallState holds the persisted user selections from the last install run.
 type InstallState struct {
-	InstalledAgents []string `json:"installed_agents"`
+	InstalledAgents     []string            `json:"installed_agents"`
+	SelectionConfigured bool                `json:"selection_configured,omitempty"`
+	Components          []model.ComponentID `json:"components,omitempty"`
+	Skills              []model.SkillID     `json:"skills,omitempty"`
+	Preset              model.PresetID      `json:"preset,omitempty"`
+	SDDMode             model.SDDModeID     `json:"sdd_mode,omitempty"`
+	StrictTDD           bool                `json:"strict_tdd,omitempty"`
 	// CommunityTools records optional tools explicitly selected in the Gentle AI
 	// installer. Configured distinguishes a completed empty selection from legacy
 	// state files that predate persistence of this choice.
@@ -128,6 +135,22 @@ func Read(homeDir string) (InstallState, error) {
 	return s, nil
 }
 
+func (s *InstallState) SetSelection(selection model.Selection) {
+	s.SelectionConfigured = true
+	s.Components = append([]model.ComponentID(nil), selection.Components...)
+	s.Skills = append([]model.SkillID(nil), selection.Skills...)
+	s.Preset, s.SDDMode, s.StrictTDD = selection.Preset, selection.SDDMode, selection.StrictTDD
+}
+
+func (s InstallState) RestoreSelection(selection *model.Selection) {
+	if !s.SelectionConfigured {
+		return
+	}
+	selection.Components = append([]model.ComponentID(nil), s.Components...)
+	selection.Skills = append([]model.SkillID(nil), s.Skills...)
+	selection.Preset, selection.SDDMode, selection.StrictTDD = s.Preset, s.SDDMode, s.StrictTDD
+}
+
 // MergeAgents returns a new InstallState that combines existing with the
 // provided newAgents. The new agents are appended to existing.InstalledAgents
 // with deduplication. All other persisted selections, including community
@@ -156,6 +179,12 @@ func MergeAgents(existing InstallState, newAgents []string) InstallState {
 
 	return InstallState{
 		InstalledAgents:             merged,
+		SelectionConfigured:         existing.SelectionConfigured,
+		Components:                  existing.Components,
+		Skills:                      existing.Skills,
+		Preset:                      existing.Preset,
+		SDDMode:                     existing.SDDMode,
+		StrictTDD:                   existing.StrictTDD,
 		CommunityTools:              existing.CommunityTools,
 		CommunityToolsConfigured:    existing.CommunityToolsConfigured,
 		ModelAssignments:            existing.ModelAssignments,

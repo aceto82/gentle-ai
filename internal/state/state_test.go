@@ -4,8 +4,11 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
+
+	"github.com/gentleman-programming/gentle-ai/internal/model"
 )
 
 // TestMergeAgents verifies that MergeAgents appends new agents to existing
@@ -108,6 +111,24 @@ func TestCommunityToolsRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.CommunityTools, want.CommunityTools) || !got.CommunityToolsConfigured {
 		t.Fatalf("community tool state = (%v, %t), want (%v, true)", got.CommunityTools, got.CommunityToolsConfigured, want.CommunityTools)
+	}
+}
+
+func TestSelectionRoundTripPreservesPresenceAndExplicitEmpty(t *testing.T) {
+	tests := []InstallState{
+		{SelectionConfigured: true, Components: []model.ComponentID{model.ComponentSDD}, Skills: []model.SkillID{model.SkillSDDInit}, Preset: model.PresetCustom, SDDMode: model.SDDModeMulti, StrictTDD: true},
+		{SelectionConfigured: true, Components: []model.ComponentID{}, Skills: []model.SkillID{}, Preset: model.PresetCustom},
+		{InstalledAgents: []string{"opencode"}},
+	}
+	for i, want := range tests {
+		home := t.TempDir()
+		if err := Write(home, want); err != nil {
+			t.Fatal(err)
+		}
+		got, err := Read(home)
+		if err != nil || got.SelectionConfigured != want.SelectionConfigured || !slices.Equal(got.Components, want.Components) || !slices.Equal(got.Skills, want.Skills) || got.Preset != want.Preset || got.SDDMode != want.SDDMode || got.StrictTDD != want.StrictTDD {
+			t.Errorf("case %d selection = %#v, want %#v", i, got, want)
+		}
 	}
 }
 

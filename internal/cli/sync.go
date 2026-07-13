@@ -51,6 +51,11 @@ type SyncFlags struct {
 	// --profile and --profile-phase flags before parsing into model.Profile.
 	rawProfiles      []string
 	rawProfilePhases []string
+	skillsSet        bool
+	sddModeSet       bool
+	strictTDDSet     bool
+	permissionsSet   bool
+	themeSet         bool
 }
 
 // SyncResult holds the outcome of a sync execution.
@@ -97,6 +102,20 @@ func ParseSyncFlags(args []string) (SyncFlags, error) {
 	if err := fs.Parse(args); err != nil {
 		return SyncFlags{}, err
 	}
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "skill", "skills":
+			opts.skillsSet = true
+		case "sdd-mode":
+			opts.sddModeSet = true
+		case "strict-tdd":
+			opts.strictTDDSet = true
+		case "include-permissions":
+			opts.permissionsSet = true
+		case "include-theme":
+			opts.themeSet = true
+		}
+	})
 
 	if fs.NArg() > 0 {
 		return SyncFlags{}, fmt.Errorf("unexpected sync argument %q", fs.Arg(0))
@@ -319,6 +338,42 @@ func BuildSyncSelection(flags SyncFlags, agentIDs []model.AgentID) model.Selecti
 		// Persona is left as zero-value here. RunSync resolves it from state.json
 		// when present. Missing or invalid persisted persona resolves to neutral
 		// so sync does not silently reactivate regional persona behavior.
+	}
+}
+
+func RestorePersistedSelection(selection *model.Selection, persisted state.InstallState, flags SyncFlags) {
+	if !persisted.SelectionConfigured {
+		return
+	}
+	explicit := *selection
+	persisted.RestoreSelection(selection)
+	if flags.skillsSet {
+		selection.Skills = explicit.Skills
+		setSelectionComponent(selection, model.ComponentSkills, true, true)
+	}
+	if flags.sddModeSet {
+		selection.SDDMode = explicit.SDDMode
+	}
+	if flags.strictTDDSet {
+		selection.StrictTDD = explicit.StrictTDD
+	}
+	setSelectionComponent(selection, model.ComponentPermission, flags.permissionsSet, flags.IncludePermissions)
+	setSelectionComponent(selection, model.ComponentTheme, flags.themeSet, flags.IncludeTheme)
+}
+
+func setSelectionComponent(selection *model.Selection, component model.ComponentID, configured, included bool) {
+	if !configured {
+		return
+	}
+	filtered := selection.Components[:0]
+	for _, current := range selection.Components {
+		if current != component {
+			filtered = append(filtered, current)
+		}
+	}
+	selection.Components = filtered
+	if included {
+		selection.Components = append(selection.Components, component)
 	}
 }
 
@@ -1220,6 +1275,7 @@ func RunSync(args []string) (SyncResult, error) {
 	// On error (e.g. state.json absent), treat persisted values as empty — model
 	// maps stay as-is and persona falls back to neutral.
 	persistedState, _ := state.Read(homeDir)
+	RestorePersistedSelection(&selection, persistedState, flags)
 	restorePersistedCommunityTools(homeDir, &selection, persistedState)
 
 	// Load persisted model assignments from state when not provided via flags.

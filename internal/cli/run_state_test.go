@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/gentleman-programming/gentle-ai/internal/model"
 	"github.com/gentleman-programming/gentle-ai/internal/state"
+	"github.com/gentleman-programming/gentle-ai/internal/system"
 )
 
 func TestMergeExplicitAgentInstallStatePreservesExistingAssignmentsWhenFreshStateIsEmpty(t *testing.T) {
@@ -36,7 +38,7 @@ func TestMergeExplicitAgentInstallStatePreservesExistingAssignmentsWhenFreshStat
 		t.Fatalf("state.Write: %v", err)
 	}
 
-	merged, ok := mergeExplicitAgentInstallState(home, state.InstallState{InstalledAgents: []string{"codex"}, Persona: "gentleman"}, []string{"codex"})
+	merged, ok := mergeExplicitAgentInstallState(home, state.InstallState{InstalledAgents: []string{"codex"}, Persona: "gentleman"}, []string{"codex"}, InstallFlags{})
 	if !ok {
 		t.Fatal("mergeExplicitAgentInstallState ok = false, want true")
 	}
@@ -66,6 +68,37 @@ func TestMergeExplicitAgentInstallStatePreservesExistingAssignmentsWhenFreshStat
 	}
 }
 
+func TestMergeExplicitAgentInstallStateMergesOnlyExplicitSelectionField(t *testing.T) {
+	original := state.InstallState{InstalledAgents: []string{"opencode"}, SelectionConfigured: true, Components: []model.ComponentID{model.ComponentEngram}, Skills: []model.SkillID{model.SkillCommentWriter}, Preset: model.PresetCustom, SDDMode: model.SDDModeSingle, StrictTDD: true, Persona: "neutral"}
+	fresh := state.InstallState{InstalledAgents: []string{"codex"}, SelectionConfigured: true, Components: []model.ComponentID{model.ComponentSDD}, Skills: []model.SkillID{model.SkillSDDInit}, Preset: model.PresetFullGentleman, SDDMode: model.SDDModeMulti, Persona: "gentleman"}
+	cases := []InstallFlags{{Components: []string{"sdd"}}, {Skills: []string{"sdd-init"}}, {Preset: "full-gentleman"}, {SDDMode: "multi"}, {Persona: "gentleman"}}
+	wants := []string{"[sdd]|[comment-writer]|custom|single|true|neutral", "[engram]|[sdd-init]|custom|single|true|neutral", "[engram]|[comment-writer]|full-gentleman|single|true|neutral", "[engram]|[comment-writer]|custom|multi|true|neutral", "[engram]|[comment-writer]|custom|single|true|gentleman"}
+	for i, flags := range cases {
+		home := t.TempDir()
+		if err := state.Write(home, original); err != nil {
+			t.Fatal(err)
+		}
+		got, ok := mergeExplicitAgentInstallState(home, fresh, []string{"codex"}, flags)
+		if key := fmt.Sprintf("%v|%v|%s|%s|%t|%s", got.Components, got.Skills, got.Preset, got.SDDMode, got.StrictTDD, got.Persona); !ok || key != wants[i] {
+			t.Errorf("flags %#v merged selection %s", flags, key)
+		}
+	}
+}
+
+func TestRunInstallPersistsConfiguredSelection(t *testing.T) {
+	home := t.TempDir()
+	original := osUserHomeDir
+	osUserHomeDir = func() (string, error) { return home, nil }
+	t.Cleanup(func() { osUserHomeDir = original })
+	if _, err := RunInstall([]string{"--agent", "cursor", "--preset", "custom", "--sdd-mode", "multi"}, system.DetectionResult{}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := state.Read(home)
+	if err != nil || !got.SelectionConfigured || got.Preset != model.PresetCustom || got.SDDMode != model.SDDModeMulti || len(got.Components) != 0 {
+		t.Fatalf("persisted selection = %#v, err = %v", got, err)
+	}
+}
+
 func TestMergeExplicitAgentInstallStatePreservesFreshAssignments(t *testing.T) {
 	home := t.TempDir()
 	if err := state.Write(home, state.InstallState{
@@ -91,7 +124,7 @@ func TestMergeExplicitAgentInstallStatePreservesFreshAssignments(t *testing.T) {
 		Persona: "gentleman",
 	}
 
-	merged, ok := mergeExplicitAgentInstallState(home, fresh, []string{"codex"})
+	merged, ok := mergeExplicitAgentInstallState(home, fresh, []string{"codex"}, InstallFlags{})
 	if !ok {
 		t.Fatal("mergeExplicitAgentInstallState ok = false, want true")
 	}
@@ -122,7 +155,7 @@ func TestMergeExplicitAgentInstallStateSkipsCorruptState(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	_, ok := mergeExplicitAgentInstallState(home, state.InstallState{InstalledAgents: []string{"codex"}}, []string{"codex"})
+	_, ok := mergeExplicitAgentInstallState(home, state.InstallState{InstalledAgents: []string{"codex"}}, []string{"codex"}, InstallFlags{})
 	if ok {
 		t.Fatal("mergeExplicitAgentInstallState ok = true for corrupt state, want false")
 	}

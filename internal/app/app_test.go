@@ -512,6 +512,29 @@ func TestTuiSyncTargetAgentsFallsBackToDiscoveredAgents(t *testing.T) {
 	}
 }
 
+func TestTuiSyncSelectionPreservesCustomPermissionExclusion(t *testing.T) {
+	home := t.TempDir()
+	if err := state.Write(home, state.InstallState{InstalledAgents: []string{"opencode"}, SelectionConfigured: true, Components: []model.ComponentID{model.ComponentSkills}, Skills: []model.SkillID{model.SkillCommentWriter}, Preset: model.PresetCustom}); err != nil {
+		t.Fatal(err)
+	}
+	selection := model.Selection{Agents: []model.AgentID{model.AgentOpenCode}, Components: []model.ComponentID{model.ComponentPermission}, Preset: model.PresetFullGentleman}
+	loadPersistedAssignments(home, &selection)
+	if selection.HasComponent(model.ComponentPermission) || !reflect.DeepEqual(selection.Skills, []model.SkillID{model.SkillCommentWriter}) || selection.Preset != model.PresetCustom {
+		t.Fatalf("TUI sync replaced custom selection: %#v", selection)
+	}
+}
+
+func TestTUIExecutePersistsConfiguredSelection(t *testing.T) {
+	home := t.TempDir()
+	setupMockHome(t, home)
+	selection := model.Selection{Preset: model.PresetCustom, Components: []model.ComponentID{}, Skills: []model.SkillID{}, SDDMode: model.SDDModeMulti, StrictTDD: true}
+	result := tuiExecute(selection, planner.ResolvedPlan{}, system.DetectionResult{}, nil)
+	got, err := state.Read(home)
+	if result.Err != nil || err != nil || !got.SelectionConfigured || got.Preset != model.PresetCustom || got.SDDMode != model.SDDModeMulti || !got.StrictTDD || len(got.Components) != 0 || len(got.Skills) != 0 {
+		t.Fatalf("persisted selection = %#v, execute err = %v, read err = %v", got, result.Err, err)
+	}
+}
+
 func TestTuiSyncIncludesCodexPermissions(t *testing.T) {
 	t.Cleanup(codex.SetRuntimeVersionCommandForTest("codex-cli 0.144.0", nil))
 	home := t.TempDir()
@@ -628,10 +651,15 @@ func TestDeferredSyncIncludesCodexPermissionsArgs(t *testing.T) {
 	if err := state.Write(home, state.InstallState{InstalledAgents: []string{string(model.AgentCodex)}}); err != nil {
 		t.Fatalf("state.Write: %v", err)
 	}
-
-	args := syncArgsForDiscoveredAgents(home)
-	if len(args) != 1 || args[0] != "--include-permissions" {
-		t.Fatalf("syncArgsForDiscoveredAgents() = %v, want [--include-permissions]", args)
+	if args := syncArgsForDiscoveredAgents(home); len(args) != 1 || args[0] != "--include-permissions" {
+		t.Fatalf("legacy sync args = %v, want permissions", args)
+	}
+	configured := t.TempDir()
+	if err := state.Write(configured, state.InstallState{InstalledAgents: []string{"codex"}, SelectionConfigured: true, Components: []model.ComponentID{model.ComponentEngram}}); err != nil {
+		t.Fatal(err)
+	}
+	if args := syncArgsForDiscoveredAgents(configured); len(args) != 0 {
+		t.Fatalf("configured Custom sync args = %v, want none", args)
 	}
 }
 

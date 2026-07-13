@@ -219,8 +219,9 @@ func RunInstall(args []string, detection system.DetectionResult) (InstallResult,
 		ModelAssignments:            modelAssignmentsToState(input.Selection.ModelAssignments),
 		Persona:                     string(input.Selection.Persona),
 	}
+	newState.SetSelection(input.Selection)
 	if len(flags.Agents) > 0 {
-		merged, ok := mergeExplicitAgentInstallState(homeDir, newState, agentIDs)
+		merged, ok := mergeExplicitAgentInstallState(homeDir, newState, agentIDs, flags)
 		if !ok {
 			return result, nil
 		}
@@ -233,7 +234,7 @@ func RunInstall(args []string, detection system.DetectionResult) (InstallResult,
 	return result, nil
 }
 
-func mergeExplicitAgentInstallState(homeDir string, newState state.InstallState, agentIDs []string) (state.InstallState, bool) {
+func mergeExplicitAgentInstallState(homeDir string, newState state.InstallState, agentIDs []string, flags InstallFlags) (state.InstallState, bool) {
 	existing, readErr := state.Read(homeDir)
 	if readErr != nil {
 		if errors.Is(readErr, os.ErrNotExist) {
@@ -268,7 +269,21 @@ func mergeExplicitAgentInstallState(homeDir string, newState state.InstallState,
 	if newState.CodexPhaseModelAssignments != nil {
 		merged.CodexPhaseModelAssignments = newState.CodexPhaseModelAssignments
 	}
-	if merged.Persona == "" && newState.Persona != "" {
+	if merged.SelectionConfigured {
+		if len(flags.Components) > 0 {
+			merged.Components = newState.Components
+		}
+		if len(flags.Skills) > 0 {
+			merged.Skills = newState.Skills
+		}
+		if flags.Preset != "" {
+			merged.Preset = newState.Preset
+		}
+		if flags.SDDMode != "" {
+			merged.SDDMode = newState.SDDMode
+		}
+	}
+	if flags.Persona != "" || merged.Persona == "" {
 		merged.Persona = newState.Persona
 	}
 	return merged, true

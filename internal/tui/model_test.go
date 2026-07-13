@@ -4105,6 +4105,17 @@ func TestCustomPresetSkillPickerBackGoesToStrictTDD(t *testing.T) {
 	}
 }
 
+func TestSkillPickerToggleUsesCanonicalIndex(t *testing.T) {
+	all := screens.AllSkillsOrdered()
+	for i, skill := range all {
+		m := Model{Screen: ScreenSkillPicker, Cursor: i, SkillPicker: append([]model.SkillID(nil), all...)}
+		m.toggleCurrentSkill()
+		if slices.Contains(m.SkillPicker, skill) {
+			t.Errorf("cursor %d did not toggle canonical skill %q", i, skill)
+		}
+	}
+}
+
 // TestCustomPresetReviewBackGoesToStrictTDD verifies that in the custom preset,
 // pressing Back on ScreenReview when no Skills and StrictTDD should be shown
 // (SDD selected) goes back to ScreenStrictTDD.

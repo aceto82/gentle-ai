@@ -1152,7 +1152,7 @@ func (m Model) View() string {
 	case ScreenDependencyTree:
 		return screens.RenderDependencyTree(m.DependencyPlan, m.Selection, m.Cursor)
 	case ScreenSkillPicker:
-		return screens.RenderSkillPicker(m.SkillPicker, m.Cursor)
+		return screens.RenderSkillPicker(m.SkillPicker, m.Cursor, m.Height)
 	case ScreenReview:
 		return screens.RenderReview(m.Review, m.Cursor)
 	case ScreenInstalling:

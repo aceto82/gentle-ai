@@ -347,10 +347,21 @@ func StartCompactAuthority(ctx context.Context, repo string, request CompactStar
 	if err != nil {
 		return CompactStartResult{}, err
 	}
-	if len(stores) > 0 && len(leaves) != 1 {
-		return CompactStartResult{}, errors.New("multiple compact authorities require explicit predecessor-bound recovery")
-	}
+	claimants := make([]CompactStore, 0, len(leaves))
+	requestedClaims := false
 	for _, store := range leaves {
+		if compactStartClaimsTarget(ctx, requestedStore.repo, records[store.lineageID].State, request.State) {
+			claimants = append(claimants, store)
+			requestedClaims = requestedClaims || store.lineageID == request.State.LineageID
+		}
+	}
+	if existing, exists := records[request.State.LineageID]; exists && !requestedClaims {
+		return CompactStartResult{Record: existing, Action: CompactStartBlocked}, nil
+	}
+	if len(claimants) > 1 {
+		return CompactStartResult{Record: records[claimants[0].lineageID], Action: CompactStartBlocked}, nil
+	}
+	for _, store := range claimants {
 		record := records[store.lineageID]
 		switch record.State.State {
 		case StateReviewing:
@@ -391,9 +402,6 @@ func StartCompactAuthority(ctx context.Context, repo string, request CompactStar
 		return CompactStartResult{Record: record, Action: CompactStartResumed,
 			LensesRequired: len(record.State.LensResults) < len(record.State.SelectedLenses)}, nil
 	}
-	if len(stores) > 0 {
-		return CompactStartResult{Record: records[leaves[0].lineageID], Action: CompactStartBlocked}, nil
-	}
 	if err := validateCompactRepositoryEvidence(ctx, requestedStore.repo, nil, request.State, "review/start"); err != nil {
 		return CompactStartResult{}, fmt.Errorf("validate compact start repository evidence: %w", err)
 	}
@@ -430,13 +438,57 @@ func acquireCompactStartLock(ctx context.Context, path string) (*storeLock, erro
 	}
 }
 
-func compactStartCorrectionResume(ctx context.Context, repo string, existing, requested CompactState) bool {
-	if !compactStartLiveTargetMatches(ctx, repo, existing, requested, false) {
+func compactStartClaimsTarget(ctx context.Context, repo string, existing, requested CompactState) bool {
+	if (SnapshotBuilder{Repo: repo}).ValidateEvidence(ctx, requested.InitialSnapshot) != nil {
 		return false
 	}
-	if requested.InitialSnapshot.CandidateTree == existing.CurrentSnapshot.CandidateTree {
+	if existing.State == StateCorrectionRequired && compactStartCorrectionResume(ctx, repo, existing, requested) {
 		return true
 	}
+	if (existing.State == StateValidating || existing.State == StateApproved) &&
+		compactStartLiveTargetMatches(ctx, repo, existing, requested, true) {
+		return true
+	}
+	if !compactStartDeliveryScopeMatches(existing, requested) {
+		return false
+	}
+	candidate := requested.InitialSnapshot.CandidateTree
+	return candidate == existing.InitialSnapshot.CandidateTree || candidate == existing.CurrentSnapshot.CandidateTree
+}
+
+// compactStartDeliveryScopeMatches compares the immutable delivery boundary
+// without Snapshot.Identity because current-changes and base-diff have distinct
+// representations for the same base-to-candidate tree range.
+func compactStartDeliveryScopeMatches(existing, requested CompactState) bool {
+	original, live := existing.InitialSnapshot, requested.InitialSnapshot
+	return compactStartTargetKindsCompatible(original.Kind, live.Kind) &&
+		live.BaseTree == original.BaseTree &&
+		live.PathsDigest == original.PathsDigest &&
+		equalStrings(live.Paths, existing.GenesisPaths) &&
+		equalStrings(live.IntendedUntracked, original.IntendedUntracked) &&
+		live.IntendedUntrackedProof == original.IntendedUntrackedProof &&
+		equalStrings(live.LedgerIDs, original.LedgerIDs)
+}
+
+func compactStartTargetKindsCompatible(existing, requested TargetKind) bool {
+	if existing == requested {
+		return true
+	}
+	return existing == TargetCurrentChanges && requested == TargetBaseDiff ||
+		existing == TargetBaseDiff && requested == TargetCurrentChanges
+}
+
+func compactStartInitialSnapshotsEqual(existing, requested CompactState) bool {
+	return compactStartDeliveryScopeMatches(existing, requested) &&
+		existing.InitialSnapshot.CandidateTree == requested.InitialSnapshot.CandidateTree
+}
+
+func compactStartCorrectionResume(ctx context.Context, repo string, existing, requested CompactState) bool {
+	return compactStartLiveTargetMatches(ctx, repo, existing, requested, false) &&
+		(requested.InitialSnapshot.CandidateTree == existing.CurrentSnapshot.CandidateTree || compactStartCorrectionCandidateMatches(ctx, repo, existing, requested))
+}
+
+func compactStartCorrectionCandidateMatches(ctx context.Context, repo string, existing, requested CompactState) bool {
 	if existing.ProposedCorrectionLines == nil {
 		return false
 	}
@@ -454,10 +506,12 @@ func compactStartLiveTargetMatches(ctx context.Context, repo string, existing, r
 	live := requested.InitialSnapshot
 	if existing.Generation != requested.Generation || existing.PolicyHash != requested.PolicyHash ||
 		!reflect.DeepEqual(existing.Recovery, requested.Recovery) ||
-		(live.Kind != TargetCurrentChanges && live.Kind != TargetBaseDiff) ||
+		!compactStartTargetKindsCompatible(existing.InitialSnapshot.Kind, live.Kind) ||
 		live.BaseTree != existing.InitialSnapshot.BaseTree ||
 		(requireCurrentCandidate && live.CandidateTree != existing.CurrentSnapshot.CandidateTree) ||
-		!equalStrings(live.Paths, existing.GenesisPaths) || !equalStrings(live.IntendedUntracked, existing.InitialSnapshot.IntendedUntracked) || len(live.LedgerIDs) != 0 {
+		pathsAreSubset(live.Paths, existing.GenesisPaths) != nil ||
+		!equalStrings(live.IntendedUntracked, existing.InitialSnapshot.IntendedUntracked) ||
+		live.IntendedUntrackedProof != existing.InitialSnapshot.IntendedUntrackedProof || len(live.LedgerIDs) != 0 {
 		return false
 	}
 	return (SnapshotBuilder{Repo: repo}).ValidateEvidence(ctx, live) == nil
@@ -465,7 +519,7 @@ func compactStartLiveTargetMatches(ctx context.Context, repo string, existing, r
 
 func compactStartScopeEqual(existing, requested CompactState) bool {
 	return existing.Generation == requested.Generation &&
-		snapshotsEqual(existing.InitialSnapshot, requested.InitialSnapshot) &&
+		compactStartInitialSnapshotsEqual(existing, requested) &&
 		equalStrings(existing.GenesisPaths, requested.GenesisPaths) &&
 		existing.PolicyHash == requested.PolicyHash && existing.RiskLevel == requested.RiskLevel &&
 		equalStrings(existing.SelectedLenses, requested.SelectedLenses) &&

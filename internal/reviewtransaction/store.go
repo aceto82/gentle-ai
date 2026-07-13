@@ -747,6 +747,7 @@ func validateSuccessorCounters(previous, next Transaction) error {
 
 func snapshotsEqual(previous, next Snapshot) bool {
 	return previous.Kind == next.Kind &&
+		previous.Projection == next.Projection &&
 		previous.BaseTree == next.BaseTree &&
 		previous.CandidateTree == next.CandidateTree &&
 		previous.PathsDigest == next.PathsDigest &&

@@ -18,15 +18,21 @@ import (
 
 type TargetKind string
 
+type Projection string
+
 const (
 	TargetCurrentChanges TargetKind = "current-changes"
 	TargetBaseDiff       TargetKind = "base-diff"
 	TargetExactRevision  TargetKind = "commit-range"
 	TargetFixDiff        TargetKind = "fix-diff"
+
+	ProjectionWorkspace Projection = "workspace"
+	ProjectionStaged    Projection = "staged"
 )
 
 type Target struct {
 	Kind              TargetKind `json:"kind"`
+	Projection        Projection `json:"projection,omitempty"`
 	BaseRef           string     `json:"base_ref,omitempty"`
 	Revision          string     `json:"revision,omitempty"`
 	IntendedUntracked []string   `json:"intended_untracked"`
@@ -35,6 +41,7 @@ type Target struct {
 
 type Snapshot struct {
 	Kind                   TargetKind `json:"kind"`
+	Projection             Projection `json:"projection,omitempty"`
 	BaseTree               string     `json:"base_tree"`
 	CandidateTree          string     `json:"candidate_tree"`
 	PathsDigest            string     `json:"paths_digest"`
@@ -62,6 +69,14 @@ func (builder SnapshotBuilder) build(ctx context.Context, target Target, allowSt
 	}
 	builder.Repo = repo
 
+	projection, err := canonicalProjection(target.Projection)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if projection == ProjectionStaged && target.Kind != TargetCurrentChanges && target.Kind != TargetBaseDiff && target.Kind != TargetFixDiff {
+		return Snapshot{}, errors.New("staged projection is only supported for current-changes, base-diff, and fix-diff targets")
+	}
+
 	var baseTree, candidateTree, untrackedProof string
 	intended := []string{}
 	ledgerIDs, err := canonicalStrings(target.LedgerIDs, "ledger id")
@@ -78,7 +93,10 @@ func (builder SnapshotBuilder) build(ctx context.Context, target Target, allowSt
 		if err != nil {
 			return Snapshot{}, err
 		}
-		baseTree, candidateTree, untrackedProof, err = builder.buildCurrentChanges(ctx, intended, allowStagedIntended)
+		if projection == ProjectionStaged && len(intended) != 0 {
+			return Snapshot{}, errors.New("staged projection does not accept intended-untracked paths")
+		}
+		baseTree, candidateTree, untrackedProof, err = builder.buildCurrentChanges(ctx, intended, allowStagedIntended, projection)
 	case TargetBaseDiff:
 		if strings.TrimSpace(target.BaseRef) == "" {
 			return Snapshot{}, errors.New("base-diff requires base_ref")
@@ -90,8 +108,16 @@ func (builder SnapshotBuilder) build(ctx context.Context, target Target, allowSt
 		if err != nil {
 			return Snapshot{}, err
 		}
+		if projection == ProjectionStaged && len(intended) != 0 {
+			return Snapshot{}, errors.New("staged projection does not accept intended-untracked paths")
+		}
 		baseTree, err = builder.resolveTree(ctx, target.BaseRef)
-		if err == nil {
+		if err == nil && projection == ProjectionStaged {
+			candidateTree, err = builder.resolveTree(ctx, "HEAD")
+			if err == nil {
+				untrackedProof, err = builder.untrackedProof(ctx, candidateTree, intended)
+			}
+		} else if err == nil {
 			candidateTree, untrackedProof, err = builder.buildHeadWithIntended(ctx, intended)
 		}
 	case TargetExactRevision:
@@ -108,7 +134,10 @@ func (builder SnapshotBuilder) build(ctx context.Context, target Target, allowSt
 		if err != nil {
 			return Snapshot{}, err
 		}
-		_, candidateTree, untrackedProof, err = builder.buildCurrentChanges(ctx, intended, false)
+		if projection == ProjectionStaged && len(intended) != 0 {
+			return Snapshot{}, errors.New("staged projection does not accept intended-untracked paths")
+		}
+		_, candidateTree, untrackedProof, err = builder.buildCurrentChanges(ctx, intended, false, projection)
 		if err == nil {
 			baseTree, err = builder.resolveTree(ctx, target.BaseRef)
 		}
@@ -124,9 +153,9 @@ func (builder SnapshotBuilder) build(ctx context.Context, target Target, allowSt
 		return Snapshot{}, err
 	}
 	pathsDigest := digestPaths(paths)
-	identity := snapshotIdentity(target.Kind, baseTree, candidateTree, pathsDigest, untrackedProof, intended, ledgerIDs)
+	identity := snapshotIdentityForProjection(target.Kind, projection, baseTree, candidateTree, pathsDigest, untrackedProof, intended, ledgerIDs)
 	return Snapshot{
-		Kind: target.Kind, BaseTree: baseTree, CandidateTree: candidateTree,
+		Kind: target.Kind, Projection: projection, BaseTree: baseTree, CandidateTree: candidateTree,
 		PathsDigest: pathsDigest, IntendedUntracked: intended,
 		IntendedUntrackedProof: untrackedProof, LedgerIDs: ledgerIDs,
 		Paths: paths, Identity: identity,
@@ -197,7 +226,11 @@ func (builder SnapshotBuilder) ValidateEvidence(ctx context.Context, snapshot Sn
 		return err
 	}
 	digest := digestPaths(paths)
-	identity := snapshotIdentity(snapshot.Kind, snapshot.BaseTree, snapshot.CandidateTree, digest, proof, snapshot.IntendedUntracked, snapshot.LedgerIDs)
+	projection, err := canonicalProjection(snapshot.Projection)
+	if err != nil {
+		return err
+	}
+	identity := snapshotIdentityForProjection(snapshot.Kind, projection, snapshot.BaseTree, snapshot.CandidateTree, digest, proof, snapshot.IntendedUntracked, snapshot.LedgerIDs)
 	if !equalStrings(paths, snapshot.Paths) || digest != snapshot.PathsDigest || proof != snapshot.IntendedUntrackedProof || identity != snapshot.Identity {
 		return errors.New("snapshot paths, digests, or identity do not match Git tree evidence")
 	}
@@ -208,7 +241,7 @@ func rebuildCurrentSnapshotEvidence(ctx context.Context, repo string, snapshot S
 	if strings.TrimSpace(repo) == "" {
 		return errors.New("repository evidence is required for invalidation")
 	}
-	target := Target{Kind: snapshot.Kind, IntendedUntracked: append([]string(nil), snapshot.IntendedUntracked...)}
+	target := Target{Kind: snapshot.Kind, Projection: snapshot.Projection, IntendedUntracked: append([]string(nil), snapshot.IntendedUntracked...)}
 	if target.IntendedUntracked == nil {
 		target.IntendedUntracked = []string{}
 	}
@@ -369,7 +402,7 @@ func canonicalRepositoryPath(path string) (string, error) {
 	return filepath.Clean(resolved), nil
 }
 
-func (builder SnapshotBuilder) buildCurrentChanges(ctx context.Context, intended []string, allowStagedIntended bool) (string, string, string, error) {
+func (builder SnapshotBuilder) buildCurrentChanges(ctx context.Context, intended []string, allowStagedIntended bool, projection Projection) (string, string, string, error) {
 	baseTree, err := builder.resolveTree(ctx, "HEAD")
 	if err != nil {
 		return "", "", "", err
@@ -426,13 +459,15 @@ func (builder SnapshotBuilder) buildCurrentChanges(ctx context.Context, intended
 		return "", "", "", err
 	}
 	env := []string{"GIT_INDEX_FILE=" + tempIndex}
-	if _, err := runGit(ctx, builder.Repo, env, nil, "add", "-u", "--", "."); err != nil {
-		return "", "", "", err
-	}
-	if len(intended) > 0 {
-		args := append([]string{"add", "--"}, literalPathspecs(intended)...)
-		if _, err := runGit(ctx, builder.Repo, env, nil, args...); err != nil {
+	if projection != ProjectionStaged {
+		if _, err := runGit(ctx, builder.Repo, env, nil, "add", "-u", "--", "."); err != nil {
 			return "", "", "", err
+		}
+		if len(intended) > 0 {
+			args := append([]string{"add", "--"}, literalPathspecs(intended)...)
+			if _, err := runGit(ctx, builder.Repo, env, nil, args...); err != nil {
+				return "", "", "", err
+			}
 		}
 	}
 	candidateOutput, err := runGit(ctx, builder.Repo, env, nil, "write-tree")
@@ -440,7 +475,7 @@ func (builder SnapshotBuilder) buildCurrentChanges(ctx context.Context, intended
 		return "", "", "", err
 	}
 	candidateTree := strings.TrimSpace(string(candidateOutput))
-	if allowStagedIntended {
+	if allowStagedIntended && projection != ProjectionStaged {
 		if _, err := runGit(ctx, builder.Repo, nil, nil, "diff", "--cached", "--quiet", candidateTree, "--"); err != nil {
 			return "", "", "", errors.New("staged tree does not exactly match the complete reviewed candidate")
 		}
@@ -637,10 +672,33 @@ func digestPaths(paths []string) string {
 	return "sha256:" + hex.EncodeToString(hash.Sum(nil))
 }
 
+func canonicalProjection(projection Projection) (Projection, error) {
+	switch projection {
+	case "", ProjectionWorkspace:
+		return "", nil
+	case ProjectionStaged:
+		return ProjectionStaged, nil
+	default:
+		return "", fmt.Errorf("unsupported projection %q", projection)
+	}
+}
+
 func snapshotIdentity(kind TargetKind, baseTree, candidateTree, pathsDigest, proof string, intended, ledgerIDs []string) string {
+	return snapshotIdentityForProjection(kind, "", baseTree, candidateTree, pathsDigest, proof, intended, ledgerIDs)
+}
+
+func snapshotIdentityForProjection(kind TargetKind, projection Projection, baseTree, candidateTree, pathsDigest, proof string, intended, ledgerIDs []string) string {
 	hash := sha256.New()
-	hash.Write([]byte("gentle-ai.review-snapshot/v1\x00"))
-	for _, value := range []string{string(kind), baseTree, candidateTree, pathsDigest, proof} {
+	if projection == ProjectionStaged {
+		hash.Write([]byte("gentle-ai.review-snapshot/v2\x00"))
+	} else {
+		hash.Write([]byte("gentle-ai.review-snapshot/v1\x00"))
+	}
+	values := []string{string(kind), baseTree, candidateTree, pathsDigest, proof}
+	if projection == ProjectionStaged {
+		values = []string{string(kind), string(projection), baseTree, candidateTree, pathsDigest, proof}
+	}
+	for _, value := range values {
 		writeLengthPrefixed(hash, []byte(value))
 	}
 	for _, value := range intended {

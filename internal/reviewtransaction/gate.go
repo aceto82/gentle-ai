@@ -176,6 +176,13 @@ func EvaluateNativeGate(ctx context.Context, repo string, receipt Receipt, reque
 	if !reflect.DeepEqual(authoritativeReceipt, receipt) {
 		return invalid("receipt does not match the authoritative transaction revision")
 	}
+	if request.Gate == GatePostApply || request.Gate == GatePreCommit {
+		requestedProjection, requestErr := canonicalProjection(request.Target.Projection)
+		authoritativeProjection, authorityErr := canonicalProjection(record.Transaction.Snapshot.Projection)
+		if requestErr != nil || authorityErr != nil || requestedProjection != authoritativeProjection {
+			return invalid("current repository target projection does not match the authoritative transaction snapshot")
+		}
+	}
 	denialContext := GateContext{
 		Gate: request.Gate, LineageID: record.Transaction.LineageID, Generation: record.Transaction.Generation,
 		StoreRevision: revision, GenesisRevision: chain.GenesisRevision, ChainIdentity: chain.Identity, BundleDigest: bundleDigest,
@@ -723,7 +730,7 @@ func lifecycleTargetForGate(ctx context.Context, repo string, request GateReques
 		if intended == nil {
 			intended = []string{}
 		}
-		return Target{Kind: TargetCurrentChanges, IntendedUntracked: intended}, nil
+		return Target{Kind: TargetCurrentChanges, Projection: request.Target.Projection, IntendedUntracked: intended}, nil
 	case GatePrePush:
 		head, err := runGit(ctx, repo, nil, nil, "rev-parse", "HEAD")
 		if err != nil {

@@ -84,6 +84,7 @@ type CompactRecoveryProvenance struct {
 type CompactReceipt struct {
 	Schema             string        `json:"schema"`
 	LineageID          string        `json:"lineage_id"`
+	Projection         Projection    `json:"projection,omitempty"`
 	Generation         int           `json:"generation"`
 	BaseTree           string        `json:"base_tree"`
 	InitialReviewTree  string        `json:"initial_review_tree"`
@@ -181,6 +182,9 @@ func (state CompactState) Validate() error {
 	if err := validateCompactSnapshotMetadata(state.CurrentSnapshot); err != nil {
 		return fmt.Errorf("current snapshot: %w", err)
 	}
+	if state.CurrentSnapshot.Projection != state.InitialSnapshot.Projection {
+		return errors.New("compact current snapshot must retain the initial projection")
+	}
 	if state.CurrentSnapshot.BaseTree != state.InitialSnapshot.BaseTree && state.CurrentSnapshot.Kind != TargetFixDiff {
 		return errors.New("compact current snapshot must retain the original base or be a fix diff")
 	}
@@ -275,7 +279,7 @@ func validateCompactSnapshotMetadata(snapshot Snapshot) error {
 	if err != nil || !equalStrings(ledgerIDs, snapshot.LedgerIDs) {
 		return errors.New("compact snapshot ledger IDs are not canonical")
 	}
-	wantIdentity := snapshotIdentity(snapshot.Kind, snapshot.BaseTree, snapshot.CandidateTree, snapshot.PathsDigest, snapshot.IntendedUntrackedProof, snapshot.IntendedUntracked, snapshot.LedgerIDs)
+	wantIdentity := snapshotIdentityForProjection(snapshot.Kind, snapshot.Projection, snapshot.BaseTree, snapshot.CandidateTree, snapshot.PathsDigest, snapshot.IntendedUntrackedProof, snapshot.IntendedUntracked, snapshot.LedgerIDs)
 	if snapshot.Identity != wantIdentity {
 		return errors.New("compact snapshot identity does not match its metadata")
 	}
@@ -409,7 +413,7 @@ func validateCompactCorrection(state CompactState) error {
 	if len(state.CorrectionAttempts) > 0 {
 		base, cumulative := state.InitialSnapshot.CandidateTree, 0
 		for _, attempt := range state.CorrectionAttempts {
-			if attempt.ProposedLines <= 0 || attempt.ActualLines < 0 || attempt.Snapshot.Kind != TargetFixDiff || attempt.Snapshot.BaseTree != base ||
+			if attempt.ProposedLines <= 0 || attempt.ActualLines < 0 || attempt.Snapshot.Kind != TargetFixDiff || attempt.Snapshot.Projection != state.InitialSnapshot.Projection || attempt.Snapshot.BaseTree != base ||
 				!equalStrings(attempt.Snapshot.LedgerIDs, state.FixFindingIDs) || pathsAreSubset(attempt.Snapshot.Paths, state.GenesisPaths) != nil ||
 				attempt.FixDeltaHash != FixDeltaHashForSnapshot(attempt.Snapshot) {
 				return errors.New("compact correction attempt is outside frozen scope")
@@ -626,8 +630,11 @@ func (state *CompactState) CompleteCorrection(snapshot Snapshot, actual int, val
 	if state.State != StateCorrectionRequired || state.ProposedCorrectionLines == nil {
 		return fmt.Errorf("cannot complete correction from compact state %q", state.State)
 	}
-	if snapshot.Kind != TargetFixDiff || snapshot.BaseTree != state.CurrentSnapshot.CandidateTree || !equalStrings(snapshot.LedgerIDs, state.FixFindingIDs) {
-		return errors.New("compact correction snapshot is not bound to the reviewed candidate and causal findings")
+	if snapshot.Kind != TargetFixDiff || snapshot.Projection != state.InitialSnapshot.Projection || snapshot.BaseTree != state.CurrentSnapshot.CandidateTree || !equalStrings(snapshot.LedgerIDs, state.FixFindingIDs) {
+		return errors.New("compact correction snapshot is not bound to the reviewed candidate, projection, and causal findings")
+	}
+	if snapshot.CandidateTree == snapshot.BaseTree {
+		return errors.New("compact correction has an unchanged candidate tree")
 	}
 	if err := pathsAreSubset(snapshot.Paths, state.GenesisPaths); err != nil {
 		return err
@@ -703,7 +710,8 @@ func (state CompactState) Receipt() (CompactReceipt, error) {
 	}
 	receipt := CompactReceipt{
 		Schema: CompactReceiptSchema, LineageID: state.LineageID, Generation: state.Generation,
-		BaseTree: state.InitialSnapshot.BaseTree, InitialReviewTree: state.InitialSnapshot.CandidateTree,
+		Projection: state.InitialSnapshot.Projection,
+		BaseTree:   state.InitialSnapshot.BaseTree, InitialReviewTree: state.InitialSnapshot.CandidateTree,
 		FinalCandidateTree: state.CurrentSnapshot.CandidateTree, PathsDigest: state.InitialSnapshot.PathsDigest,
 		FixDeltaHash: state.FixDeltaHash, PolicyHash: state.PolicyHash, EvidenceHash: evidence,
 		RiskLevel: state.RiskLevel, SelectedLenses: append([]string(nil), state.SelectedLenses...),
@@ -713,6 +721,10 @@ func (state CompactState) Receipt() (CompactReceipt, error) {
 }
 
 func (receipt CompactReceipt) Validate() error {
+	projection, err := canonicalProjection(receipt.Projection)
+	if err != nil || projection != receipt.Projection {
+		return errors.New("compact receipt projection is unsupported or non-canonical")
+	}
 	if receipt.Schema != CompactReceiptSchema || validateLineageID(receipt.LineageID) != nil || receipt.Generation < 1 {
 		return errors.New("invalid compact review receipt identity")
 	}

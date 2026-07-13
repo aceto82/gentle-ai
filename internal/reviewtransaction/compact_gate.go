@@ -159,7 +159,7 @@ func buildCompactGateRequest(ctx context.Context, repo string, state CompactStat
 		if intended == nil {
 			intended = append([]string(nil), state.CurrentSnapshot.IntendedUntracked...)
 		}
-		request.Target = Target{Kind: TargetCurrentChanges, IntendedUntracked: intended}
+		request.Target = Target{Kind: TargetCurrentChanges, Projection: state.InitialSnapshot.Projection, IntendedUntracked: intended}
 	case GatePrePush:
 		deliveryBaseTree := map[TargetKind]string{TargetCurrentChanges: state.InitialSnapshot.BaseTree}[state.InitialSnapshot.Kind]
 		target, push, err := buildPushTarget(ctx, repo, input.BaseRef, deliveryBaseTree)

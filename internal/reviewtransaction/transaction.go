@@ -1194,6 +1194,16 @@ func (transaction *Transaction) escalateBudget(name string) error {
 }
 
 func validateSnapshot(snapshot Snapshot) error {
+	projection, err := canonicalProjection(snapshot.Projection)
+	if err != nil || projection != snapshot.Projection {
+		return errors.New("snapshot projection is unsupported or non-canonical")
+	}
+	if projection == ProjectionStaged && snapshot.Kind != TargetCurrentChanges && snapshot.Kind != TargetBaseDiff && snapshot.Kind != TargetFixDiff {
+		return errors.New("staged snapshot projection requires current-changes, base-diff, or fix-diff")
+	}
+	if projection == ProjectionStaged && len(snapshot.IntendedUntracked) != 0 {
+		return errors.New("staged snapshot projection cannot contain intended-untracked paths")
+	}
 	if snapshot.Kind == "" || !validGitTree(snapshot.BaseTree) || !validGitTree(snapshot.CandidateTree) {
 		return errors.New("snapshot requires kind, base_tree, and candidate_tree")
 	}

@@ -106,6 +106,9 @@ func RecoverCompactAuthority(ctx context.Context, repo string, request CompactRe
 	if predecessor.Revision != request.ExpectedPredecessorRevision {
 		return CompactRecord{}, fmt.Errorf("%w: expected predecessor revision %q, current %q", ErrConcurrentUpdate, request.ExpectedPredecessorRevision, predecessor.Revision)
 	}
+	if predecessor.State.InitialSnapshot.Projection != request.Successor.InitialSnapshot.Projection {
+		return CompactRecord{}, errors.New("recovery successor must retain the predecessor projection")
+	}
 	existing, existingErr := successorStore.Load()
 	if existingErr != nil && !os.IsNotExist(existingErr) {
 		return CompactRecord{}, existingErr
@@ -461,7 +464,8 @@ func compactStartClaimsTarget(ctx context.Context, repo string, existing, reques
 // representations for the same base-to-candidate tree range.
 func compactStartDeliveryScopeMatches(existing, requested CompactState) bool {
 	original, live := existing.InitialSnapshot, requested.InitialSnapshot
-	return compactStartTargetKindsCompatible(original.Kind, live.Kind) &&
+	return original.Projection == live.Projection &&
+		compactStartTargetKindsCompatible(original.Kind, live.Kind) &&
 		live.BaseTree == original.BaseTree &&
 		live.PathsDigest == original.PathsDigest &&
 		equalStrings(live.Paths, existing.GenesisPaths) &&
@@ -493,8 +497,8 @@ func compactStartCorrectionCandidateMatches(ctx context.Context, repo string, ex
 		return false
 	}
 	fix, err := (SnapshotBuilder{Repo: repo}).Build(ctx, Target{Kind: TargetFixDiff,
-		BaseRef: existing.CurrentSnapshot.CandidateTree, IntendedUntracked: existing.InitialSnapshot.IntendedUntracked,
-		LedgerIDs: existing.FixFindingIDs})
+		Projection: existing.InitialSnapshot.Projection, BaseRef: existing.CurrentSnapshot.CandidateTree,
+		IntendedUntracked: existing.InitialSnapshot.IntendedUntracked, LedgerIDs: existing.FixFindingIDs})
 	if err != nil || fix.CandidateTree != requested.InitialSnapshot.CandidateTree || pathsAreSubset(fix.Paths, existing.GenesisPaths) != nil {
 		return false
 	}
@@ -506,6 +510,7 @@ func compactStartLiveTargetMatches(ctx context.Context, repo string, existing, r
 	live := requested.InitialSnapshot
 	if existing.Generation != requested.Generation || existing.PolicyHash != requested.PolicyHash ||
 		!reflect.DeepEqual(existing.Recovery, requested.Recovery) ||
+		existing.InitialSnapshot.Projection != live.Projection ||
 		!compactStartTargetKindsCompatible(existing.InitialSnapshot.Kind, live.Kind) ||
 		live.BaseTree != existing.InitialSnapshot.BaseTree ||
 		(requireCurrentCandidate && live.CandidateTree != existing.CurrentSnapshot.CandidateTree) ||

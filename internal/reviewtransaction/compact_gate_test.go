@@ -11,6 +11,80 @@ import (
 	"testing"
 )
 
+func TestLegacyCurrentChangesGateRejectsCallerProjectionMismatch(t *testing.T) {
+	for _, gate := range []GateKind{GatePostApply, GatePreCommit} {
+		t.Run(string(gate), func(t *testing.T) {
+			repo := initSnapshotRepo(t)
+			writeSnapshotFile(t, repo, "tracked.txt", "reviewed candidate\n")
+			transaction, receipt, request := nativeGateFixture(t, repo, "legacy-projection-mismatch-"+string(gate))
+			store, err := AuthoritativeStore(context.Background(), repo, transaction.LineageID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			appendApprovedStoreChain(t, store, transaction)
+			bindGateRequestToStore(t, &request, store)
+			request.Gate = gate
+			request.Target.Projection = ProjectionStaged
+
+			if got := EvaluateNativeGate(context.Background(), repo, receipt, request); got.Result != GateInvalidated || !strings.Contains(got.Reason, "projection") {
+				t.Fatalf("caller-selected projection = %#v", got)
+			}
+		})
+	}
+}
+
+func TestCompactStagedPreCommitBindsIndexDespiteWorkspaceDivergence(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "tracked.txt", "staged candidate\n")
+	gitSnapshot(t, repo, "add", "--", "tracked.txt")
+	state := newCompactStartStateForTarget(t, repo, "compact-staged-precommit", Target{Kind: TargetCurrentChanges, Projection: ProjectionStaged, IntendedUntracked: []string{}})
+	store, err := CompactAuthoritativeStore(context.Background(), repo, state.LineageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := store.Replace("", "review/start", state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := make([]LensResult, len(state.SelectedLenses))
+	for index, lens := range state.SelectedLenses {
+		results[index] = LensResult{Lens: lens, Findings: []Finding{}, Evidence: []string{"reviewed"}}
+	}
+	if err := state.CompleteReview(CompactReviewInput{LensResults: results, Classifications: []FindingEvidence{}, RefuterOutcomes: []EvidenceResult{}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Replace(revision, "review/complete-review", state); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.CompleteVerification([]byte("tests pass\n"), true); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Replace(record.Revision, "review/complete-verification", state); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := state.Receipt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("unstaged workspace divergence\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := EvaluateCompactGate(context.Background(), repo, receipt, NativeGateRequestInput{Gate: GatePreCommit, LineageID: state.LineageID}); got.Result != GateAllow {
+		t.Fatalf("matching staged index with divergent workspace = %#v", got)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("mutated index\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitSnapshot(t, repo, "add", "--", "tracked.txt")
+	if got := EvaluateCompactGate(context.Background(), repo, receipt, NativeGateRequestInput{Gate: GatePreCommit, LineageID: state.LineageID}); got.Result != GateScopeChanged {
+		t.Fatalf("mutated staged index = %#v, want scope changed", got)
+	}
+}
+
 func TestCompactPreCommitGatePreservesExactStagedIntendedTransition(t *testing.T) {
 	repo := initSnapshotRepo(t)
 	writeSnapshotFile(t, repo, "tracked.txt", "reviewed tracked change\n")

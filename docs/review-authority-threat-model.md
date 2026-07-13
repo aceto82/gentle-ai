@@ -25,6 +25,14 @@ The compact review store protects valid authority from accidental corruption and
 - Live-Git gate re-derivation rather than trusting persisted mirrors.
 - Checksums only where useful for detecting accidental corruption; they are not authentication.
 
+## Candidate Projections
+
+`gentle-ai review start` defaults to the legacy `workspace` projection. Use `gentle-ai review start --projection staged` to freeze exactly the Git index: unstaged and untracked worktree content is excluded, and the live index and worktree are not modified while deriving evidence. The selected projection is emitted in START JSON and retained by compact authority, receipts, corrections, recovery, and transport.
+
+After committing a staged candidate, use `gentle-ai review start --projection staged --base-ref <ref>` (and `--committed-only` when tracked workspace changes exist) to record immutable base-to-HEAD delivery provenance. It accepts no intended-untracked paths, remains domain-separated in the v2 identity, and can reuse only the matching staged authority; an otherwise identical workspace authority remains separate.
+
+For a staged authority, `post-apply` and `pre-commit` re-derive the exact index; a divergent worktree alone does not broaden or invalidate that candidate. `pre-push` and `pre-pr` continue to validate the delivered commit/base-diff tree against the same staged receipt.
+
 ## Review Input Schemas
 
 Run `gentle-ai review schema reviewer`, `gentle-ai review schema refuter`, or `gentle-ai review schema validator` to print the versioned JSON Schema and one accepted example for the existing strict facade input. Final verification evidence remains arbitrary non-empty bytes and therefore has no invented JSON contract. Unknown JSON fields and semantic violations remain rejected before authority changes.

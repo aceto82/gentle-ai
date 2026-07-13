@@ -90,6 +90,152 @@ func TestSnapshotBuilderCurrentChangesIsCompleteAndPreservesRealIndex(t *testing
 	}
 }
 
+func TestSnapshotBuilderStagedProjectionUsesExactIndexAndPreservesWorkspace(t *testing.T) {
+	requireSnapshotGit(t)
+	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "tracked.txt", "staged\n")
+	writeSnapshotFile(t, repo, "added.txt", "added\n")
+	gitSnapshot(t, repo, "add", "--", "tracked.txt", "added.txt")
+	writeSnapshotFile(t, repo, "tracked.txt", "unstaged\n")
+	writeSnapshotFile(t, repo, "untracked.txt", "untracked\n")
+
+	beforeIndex := gitSnapshot(t, repo, "diff", "--cached", "--binary")
+	snapshot, err := (SnapshotBuilder{Repo: repo}).Build(context.Background(), Target{
+		Kind: TargetCurrentChanges, Projection: ProjectionStaged, IntendedUntracked: []string{},
+	})
+	if err != nil {
+		t.Fatalf("Build(staged) error = %v", err)
+	}
+	if snapshot.Projection != ProjectionStaged {
+		t.Fatalf("Projection = %q, want %q", snapshot.Projection, ProjectionStaged)
+	}
+	if got := gitSnapshot(t, repo, "show", snapshot.CandidateTree+":tracked.txt"); got != "staged\n" {
+		t.Fatalf("staged candidate tracked.txt = %q", got)
+	}
+	if got := gitSnapshot(t, repo, "show", snapshot.CandidateTree+":added.txt"); got != "added\n" {
+		t.Fatalf("staged candidate added.txt = %q", got)
+	}
+	if gitSnapshotSucceeds(repo, "show", snapshot.CandidateTree+":untracked.txt") {
+		t.Fatal("staged candidate included an untracked worktree path")
+	}
+	if afterIndex := gitSnapshot(t, repo, "diff", "--cached", "--binary"); afterIndex != beforeIndex {
+		t.Fatalf("staged snapshot mutated index:\nbefore:\n%s\nafter:\n%s", beforeIndex, afterIndex)
+	}
+	if got, err := os.ReadFile(filepath.Join(repo, "tracked.txt")); err != nil || string(got) != "unstaged\n" {
+		t.Fatalf("staged snapshot mutated worktree: %q, %v", got, err)
+	}
+	if err := (SnapshotBuilder{Repo: repo}).ValidateEvidence(context.Background(), snapshot); err != nil {
+		t.Fatalf("ValidateEvidence(staged) error = %v", err)
+	}
+}
+
+func TestSnapshotBuilderStagedProjectionPreservesExactIndexFidelity(t *testing.T) {
+	requireSnapshotGit(t)
+	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "tracked.txt", "one\ntwo\nthree\nfour\nfive\n")
+	writeSnapshotFile(t, repo, "rename-old.txt", "rename me\n")
+	writeSnapshotFile(t, repo, "mode.txt", "mode me\n")
+	gitSnapshot(t, repo, "add", "--", "tracked.txt", "rename-old.txt", "mode.txt")
+	gitSnapshot(t, repo, "commit", "-m", "fidelity baseline")
+
+	writeSnapshotFile(t, repo, "tracked.txt", "ONE\ntwo\nthree\nfour\nFIVE\n")
+	patch := filepath.Join(t.TempDir(), "partial.patch")
+	if err := os.WriteFile(patch, []byte("diff --git a/tracked.txt b/tracked.txt\nindex b2f931a..b3c5a95 100644\n--- a/tracked.txt\n+++ b/tracked.txt\n@@ -1,4 +1,4 @@\n-one\n+ONE\n two\n three\n four\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitSnapshot(t, repo, "apply", "--cached", patch)
+	writeSnapshotFile(t, repo, "added.txt", "added\n")
+	gitSnapshot(t, repo, "add", "--", "added.txt")
+	if err := os.Remove(filepath.Join(repo, "deleted.txt")); err != nil {
+		t.Fatal(err)
+	}
+	gitSnapshot(t, repo, "add", "-u", "--", "deleted.txt")
+	if err := os.Rename(filepath.Join(repo, "rename-old.txt"), filepath.Join(repo, "renamed.txt")); err != nil {
+		t.Fatal(err)
+	}
+	gitSnapshot(t, repo, "add", "-A", "--", "rename-old.txt", "renamed.txt")
+	if err := os.Chmod(filepath.Join(repo, "mode.txt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitSnapshot(t, repo, "add", "--", "mode.txt")
+	if err := os.Symlink("tracked.txt", filepath.Join(repo, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	gitSnapshot(t, repo, "add", "--", "link.txt")
+	writeSnapshotFile(t, repo, "untracked.txt", "ignore me\n")
+
+	beforeIndex := gitSnapshot(t, repo, "diff", "--cached", "--binary")
+	indexTree := strings.TrimSpace(gitSnapshot(t, repo, "write-tree"))
+	snapshot, err := (SnapshotBuilder{Repo: repo}).Build(context.Background(), Target{Kind: TargetCurrentChanges, Projection: ProjectionStaged, IntendedUntracked: []string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.CandidateTree != indexTree {
+		t.Fatalf("staged candidate tree = %s, want exact index %s", snapshot.CandidateTree, indexTree)
+	}
+	if got := gitSnapshot(t, repo, "show", snapshot.CandidateTree+":tracked.txt"); got != "ONE\ntwo\nthree\nfour\nfive\n" {
+		t.Fatalf("partial staged hunk = %q", got)
+	}
+	if !gitSnapshotSucceeds(repo, "cat-file", "-e", snapshot.CandidateTree+":added.txt") || gitSnapshotSucceeds(repo, "cat-file", "-e", snapshot.CandidateTree+":deleted.txt") || !gitSnapshotSucceeds(repo, "cat-file", "-e", snapshot.CandidateTree+":renamed.txt") || gitSnapshotSucceeds(repo, "cat-file", "-e", snapshot.CandidateTree+":rename-old.txt") {
+		t.Fatal("staged candidate does not retain add/delete/rename index entries")
+	}
+	if got := gitSnapshot(t, repo, "ls-tree", snapshot.CandidateTree, "mode.txt"); !strings.HasPrefix(got, "100755 ") {
+		t.Fatalf("staged mode entry = %q", got)
+	}
+	if got := gitSnapshot(t, repo, "ls-tree", snapshot.CandidateTree, "link.txt"); !strings.HasPrefix(got, "120000 ") {
+		t.Fatalf("staged symlink entry = %q", got)
+	}
+	if gitSnapshotSucceeds(repo, "cat-file", "-e", snapshot.CandidateTree+":untracked.txt") {
+		t.Fatal("staged candidate included untracked worktree content")
+	}
+	if afterIndex := gitSnapshot(t, repo, "diff", "--cached", "--binary"); afterIndex != beforeIndex {
+		t.Fatal("building staged projection mutated the real index")
+	}
+}
+
+func TestSnapshotProjectionValidationAndIdentity(t *testing.T) {
+	requireSnapshotGit(t)
+	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "tracked.txt", "changed\n")
+	gitSnapshot(t, repo, "add", "--", "tracked.txt")
+	builder := SnapshotBuilder{Repo: repo}
+
+	workspace, err := builder.Build(context.Background(), Target{Kind: TargetCurrentChanges, IntendedUntracked: []string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicitWorkspace, err := builder.Build(context.Background(), Target{Kind: TargetCurrentChanges, Projection: ProjectionWorkspace, IntendedUntracked: []string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(workspace, explicitWorkspace) || workspace.Projection != "" {
+		t.Fatalf("explicit workspace changed legacy identity:\nimplicit=%#v\nexplicit=%#v", workspace, explicitWorkspace)
+	}
+	staged, err := builder.Build(context.Background(), Target{Kind: TargetCurrentChanges, Projection: ProjectionStaged, IntendedUntracked: []string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staged.CandidateTree != workspace.CandidateTree || staged.Identity == workspace.Identity {
+		t.Fatalf("projection identity was not domain-separated: workspace=%#v staged=%#v", workspace, staged)
+	}
+	if _, err := builder.Build(context.Background(), Target{Kind: TargetCurrentChanges, Projection: Projection("future"), IntendedUntracked: []string{}}); err == nil || !strings.Contains(err.Error(), "unsupported projection") {
+		t.Fatalf("unknown projection error = %v", err)
+	}
+	stagedBaseDiff, err := builder.Build(context.Background(), Target{Kind: TargetBaseDiff, Projection: ProjectionStaged, BaseRef: "HEAD", IntendedUntracked: []string{}})
+	if err != nil || stagedBaseDiff.Projection != ProjectionStaged || stagedBaseDiff.CandidateTree != strings.TrimSpace(gitSnapshot(t, repo, "rev-parse", "HEAD^{tree}")) {
+		t.Fatalf("staged base-diff snapshot = %#v, err=%v", stagedBaseDiff, err)
+	}
+	if _, err := builder.Build(context.Background(), Target{Kind: TargetBaseDiff, Projection: ProjectionStaged, BaseRef: "HEAD", IntendedUntracked: []string{"untracked.txt"}}); err == nil || !strings.Contains(err.Error(), "does not accept intended-untracked") {
+		t.Fatalf("staged base-diff intended-untracked error = %v", err)
+	}
+	if _, err := builder.Build(context.Background(), Target{Kind: TargetExactRevision, Projection: ProjectionStaged, Revision: "HEAD", IntendedUntracked: []string{}}); err == nil || !strings.Contains(err.Error(), "only supported") {
+		t.Fatalf("staged exact-revision/release error = %v", err)
+	}
+	if _, err := builder.Build(context.Background(), Target{Kind: TargetCurrentChanges, Projection: ProjectionStaged, IntendedUntracked: []string{"untracked.txt"}}); err == nil || !strings.Contains(err.Error(), "does not accept intended-untracked") {
+		t.Fatalf("staged intended-untracked error = %v", err)
+	}
+}
+
 func TestPreCommitSnapshotAllowsOnlyCompleteStagedIntendedTransition(t *testing.T) {
 	requireSnapshotGit(t)
 	repo := initSnapshotRepo(t)

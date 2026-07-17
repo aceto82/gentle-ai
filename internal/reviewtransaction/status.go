@@ -296,6 +296,21 @@ func inventoryLock(version AuthorityVersion, lineage, path string) (AuthorityLoc
 	}
 	defer file.Close()
 	lock := AuthorityLockEvidence{Version: version, LineageID: lineage, Path: path, Status: AuthorityLockAmbiguous}
+	locked, err := probeExistingStoreLock(file)
+	if err != nil {
+		lock.Problem = "probe existing lock inode: " + err.Error()
+		return lock, true
+	}
+	if !locked {
+		lock.Status = AuthorityLockOwned
+		return lock, true
+	}
+	probeHeld := true
+	defer func() {
+		if probeHeld {
+			_ = unlockFile(file)
+		}
+	}()
 	decoder := json.NewDecoder(file)
 	decoder.DisallowUnknownFields()
 	var owner storeLockOwner
@@ -312,19 +327,11 @@ func inventoryLock(version AuthorityVersion, lineage, path string) (AuthorityLoc
 		lock.Problem = "lock owner metadata is incomplete or invalid"
 		return lock, true
 	}
-	locked, err := probeExistingStoreLock(file)
-	if err != nil {
-		lock.Problem = "probe existing lock inode: " + err.Error()
-		return lock, true
-	}
-	if !locked {
-		lock.Status = AuthorityLockOwned
-		return lock, true
-	}
 	if err := unlockFile(file); err != nil {
 		lock.Problem = "release existing lock probe: " + err.Error()
 		return lock, true
 	}
+	probeHeld = false
 	lock.Status = AuthorityLockReleased
 	return lock, true
 }

@@ -30,7 +30,7 @@ func TestRunGitTypesProcessStartFailure(t *testing.T) {
 	if !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("process control cause lost: %v", err)
 	}
-	if message := err.Error(); !strings.Contains(message, "status --short") || !strings.Contains(message, "no such file") {
+	if message := err.Error(); !strings.Contains(message, "status --short") || !strings.Contains(message, filepath.Base(missing)) {
 		t.Fatalf("process control message = %q", message)
 	}
 }

@@ -413,6 +413,40 @@ func TestUnqualifiedPrePRDiscoveryComposesSequentialReceiptsForSamePath(t *testi
 	}
 }
 
+func TestUnqualifiedPrePRDiscoveryReconcilesCurrentChangesReceiptAcrossDivergedBase(t *testing.T) {
+	repo := initReviewCLIRepo(t)
+	branch := strings.TrimSpace(runReviewCLIGit(t, repo, "symbolic-ref", "--short", "HEAD"))
+	initialCommit := strings.TrimSpace(runReviewCLIGit(t, repo, "rev-parse", "HEAD"))
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	runReviewCLIGit(t, repo, "clone", "--bare", repo, remote)
+	runReviewCLIGit(t, repo, "remote", "add", "origin", remote)
+	started, _ := approveDiscoveryMarkdown(t, repo, "review-current-diverged-base", "docs/single.md", "reviewed\n")
+	runReviewCLIGit(t, repo, "add", "-A")
+	runReviewCLIGit(t, repo, "commit", "-qm", "deliver reviewed change")
+	runReviewCLIGit(t, repo, "checkout", "-qb", "base-advance", initialCommit)
+	if err := os.WriteFile(filepath.Join(repo, "base-only.txt"), []byte("base advance\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runReviewCLIGit(t, repo, "add", "base-only.txt")
+	runReviewCLIGit(t, repo, "commit", "-qm", "advance publication base")
+	runReviewCLIGit(t, repo, "push", "-q", "origin", "base-advance:refs/heads/"+branch)
+	runReviewCLIGit(t, repo, "checkout", "-q", branch)
+
+	var output bytes.Buffer
+	if err := RunReview([]string{
+		"validate", "--contract", ReviewIntegrationContractV1, "--cwd", repo,
+		"--gate", string(reviewtransaction.GatePrePR), "--base-ref", "origin/" + branch,
+	}, &output); err != nil {
+		t.Fatalf("diverged-base current-changes pre-PR validation: %v\n%s", err, output.String())
+	}
+	var result ReviewValidateResult
+	decodeStrictReviewJSON(t, decodeReviewOperationEnvelope(t, output.Bytes()).Result, &result)
+	if !result.Allowed || result.Context.LineageID != started.LineageID || result.Context.BaseAdvance == nil ||
+		!result.Context.BaseAdvance.Compatible || result.Context.BaseAdvance.Status != "current-changes-boundary-compatible" {
+		t.Fatalf("diverged-base current-changes pre-PR result = %#v", result)
+	}
+}
+
 func TestUnqualifiedPrePRDiscoveryKeepsExactSingleReceiptContext(t *testing.T) {
 	repo := initReviewCLIRepo(t)
 	branch := strings.TrimSpace(runReviewCLIGit(t, repo, "symbolic-ref", "--short", "HEAD"))

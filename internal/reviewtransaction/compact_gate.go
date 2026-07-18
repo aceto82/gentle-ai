@@ -80,8 +80,14 @@ func AssessCompactGateTarget(ctx context.Context, repo string, state CompactStat
 	if request.Gate == GatePrePR {
 		// A base advance is authorized only by the later evidence-bearing gate
 		// evaluation, but it still names this receipt when candidate and paths
-		// remain exact.
+		// remain exact, or when a current-changes receipt provably reaches the
+		// diverged publication boundary unchanged.
 		baseMatches = true
+		if !pathsMatch && snapshot.CandidateTree == state.CurrentSnapshot.CandidateTree {
+			if proof, proofErr := deriveCurrentChangesBoundaryCompatibility(ctx, repo, state, request, snapshot, resolvedPrePR); proofErr == nil && proof.Compatible {
+				pathsMatch = true
+			}
+		}
 	}
 	if snapshot.CandidateTree == state.CurrentSnapshot.CandidateTree && pathsMatch && baseMatches {
 		assessment.Applicability = CompactGateTargetExact
@@ -205,6 +211,9 @@ func EvaluateCompactGate(ctx context.Context, repo string, receipt CompactReceip
 	if request.Gate == GatePrePR && snapshot.BaseTree != receipt.BaseTree {
 		legacyShape := Receipt{BaseTree: receipt.BaseTree, FinalCandidateTree: receipt.FinalCandidateTree, PathsDigest: receipt.PathsDigest}
 		if proof, proofErr := deriveBaseAdvanceCompatibility(ctx, repo, legacyShape, request, snapshot, resolvedPrePR, preimages); proofErr == nil {
+			compatibility = &proof
+			compatibleAdvance = proof.Compatible
+		} else if proof, boundaryErr := deriveCurrentChangesBoundaryCompatibility(ctx, repo, record.State, request, snapshot, resolvedPrePR); boundaryErr == nil {
 			compatibility = &proof
 			compatibleAdvance = proof.Compatible
 		}

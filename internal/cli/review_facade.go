@@ -34,6 +34,7 @@ type ReviewFacadeStartResult struct {
 	State            reviewtransaction.State      `json:"state"`
 	RiskLevel        reviewtransaction.RiskLevel  `json:"risk_level"`
 	SelectedLenses   []string                     `json:"selected_lenses"`
+	LensBindings     []ReviewFacadeLensBinding    `json:"lens_bindings"`
 	Projection       reviewtransaction.Projection `json:"projection"`
 	TargetMode       reviewtransaction.TargetKind `json:"target_mode,omitempty"`
 	TargetIdentity   string                       `json:"target_identity,omitempty"`
@@ -42,6 +43,21 @@ type ReviewFacadeStartResult struct {
 	ChangedFiles     int                          `json:"changed_files"`
 	ChangedLines     int                          `json:"changed_lines"`
 	CorrectionBudget int                          `json:"correction_budget"`
+}
+
+// ReviewFacadeLensBinding pairs one selected lens with its frozen zero-based
+// order so orchestrators build capture bindings exclusively from START output.
+type ReviewFacadeLensBinding struct {
+	Lens  string `json:"lens"`
+	Order int    `json:"order"`
+}
+
+func facadeLensBindings(lenses []string) []ReviewFacadeLensBinding {
+	bindings := make([]ReviewFacadeLensBinding, len(lenses))
+	for order, lens := range lenses {
+		bindings[order] = ReviewFacadeLensBinding{Lens: lens, Order: order}
+	}
+	return bindings
 }
 
 func facadeProjection(projection reviewtransaction.Projection) reviewtransaction.Projection {
@@ -726,13 +742,13 @@ func runReviewFacadeStart(ctx context.Context, args []string, stdout io.Writer) 
 	legacyResult := ReviewFacadeStartResult{
 		Operation: "review/start", Action: string(started.Action), LensesRequired: started.LensesRequired,
 		LineageID: authority.LineageID, State: authority.State, RiskLevel: authority.RiskLevel,
-		SelectedLenses: append([]string{}, authority.SelectedLenses...), Projection: facadeProjection(authority.InitialSnapshot.Projection),
-		ChangedFiles: len(authority.InitialSnapshot.Paths),
+		SelectedLenses: append([]string{}, authority.SelectedLenses...), LensBindings: facadeLensBindings(authority.SelectedLenses),
+		Projection:   facadeProjection(authority.InitialSnapshot.Projection),
+		ChangedFiles: len(authority.InitialSnapshot.Paths), TargetIdentity: authority.InitialSnapshot.Identity,
 		ChangedLines: authority.OriginalChangedLines, CorrectionBudget: authority.CorrectionBudget,
 	}
 	if authority.InitialSnapshot.Kind == reviewtransaction.TargetBaseWorkspaceOverlay {
 		legacyResult.TargetMode = authority.InitialSnapshot.Kind
-		legacyResult.TargetIdentity = authority.InitialSnapshot.Identity
 		legacyResult.BaseTree = authority.InitialSnapshot.BaseTree
 		legacyResult.CandidateTree = authority.InitialSnapshot.CandidateTree
 	}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -452,6 +453,9 @@ func validateCompactUntrackedScope(ctx context.Context, repo string, state Compa
 		if _, ok := allowed[path]; ok || isPostReviewLifecycleArtifact(path) {
 			continue
 		}
+		if isChangeLocalReceiptMirror(path) && matchesAuthoritativeReceipt(repo, state, path) {
+			continue
+		}
 		return errors.New("current repository contains untracked paths outside the authoritative review scope")
 	}
 	return nil
@@ -492,4 +496,28 @@ func validateCompactPublicationRange(ctx context.Context, repo string, genesis [
 func isPostReviewLifecycleArtifact(path string) bool {
 	parts := strings.Split(path, "/")
 	return len(parts) == 4 && parts[0] == "openspec" && parts[1] == "changes" && parts[3] == "verify-report.md"
+}
+
+func isChangeLocalReceiptMirror(path string) bool {
+	parts := strings.Split(path, "/")
+	return len(parts) == 5 && parts[0] == "openspec" && parts[1] == "changes" && parts[3] == "reviews" && parts[4] == "receipt.json"
+}
+
+// matchesAuthoritativeReceipt exempts only a change-local mirror whose content
+// equals the receipt derived from the terminal authority; anything else stays
+// outside the authoritative review scope and fails closed.
+func matchesAuthoritativeReceipt(repo string, state CompactState, path string) bool {
+	authoritative, err := state.Receipt()
+	if err != nil {
+		return false
+	}
+	payload, err := os.ReadFile(filepath.Join(repo, filepath.FromSlash(path)))
+	if err != nil {
+		return false
+	}
+	mirror, err := ParseCompactReceipt(payload)
+	if err != nil {
+		return false
+	}
+	return CompactReceiptEqual(mirror, authoritative)
 }

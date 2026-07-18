@@ -315,6 +315,71 @@ func TestCompactPostApplyRejectsUnboundUntrackedPathAfterCommit(t *testing.T) {
 	}
 }
 
+func TestCompactPostApplyExemptsExactChangeLocalReceiptMirror(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "tracked.txt", "approved candidate\n")
+	state := newCompactStartStateForTarget(t, repo, "compact-receipt-mirror-exact", Target{Kind: TargetCurrentChanges, IntendedUntracked: []string{}})
+	state, receipt := persistApprovedCompactState(t, repo, state)
+	gitSnapshot(t, repo, "add", "tracked.txt")
+	gitSnapshot(t, repo, "commit", "-m", "reviewed candidate")
+
+	mirror := filepath.Join(repo, "openspec", "changes", "thin", "reviews", "receipt.json")
+	if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteCompactReceiptAtomic(mirror, receipt); err != nil {
+		t.Fatal(err)
+	}
+
+	got := EvaluateCompactGate(context.Background(), repo, receipt, NativeGateRequestInput{Gate: GatePostApply, LineageID: state.LineageID})
+	if got.Result != GateAllow {
+		t.Fatalf("exact change-local receipt mirror = %#v", got)
+	}
+}
+
+func TestCompactPostApplyRejectsMismatchedChangeLocalReceiptMirror(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload func(t *testing.T, receipt CompactReceipt) []byte
+	}{
+		{name: "divergent receipt", payload: func(t *testing.T, receipt CompactReceipt) []byte {
+			tampered := receipt
+			tampered.Generation++
+			payload, err := json.MarshalIndent(tampered, "", "  ")
+			if err != nil {
+				t.Fatal(err)
+			}
+			return append(payload, '\n')
+		}},
+		{name: "malformed payload", payload: func(t *testing.T, receipt CompactReceipt) []byte {
+			return []byte("{\"schema\":\"tampered\"}\n")
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := initSnapshotRepo(t)
+			writeSnapshotFile(t, repo, "tracked.txt", "approved candidate\n")
+			state := newCompactStartStateForTarget(t, repo, "compact-receipt-mirror-"+strings.ReplaceAll(tt.name, " ", "-"), Target{Kind: TargetCurrentChanges, IntendedUntracked: []string{}})
+			state, receipt := persistApprovedCompactState(t, repo, state)
+			gitSnapshot(t, repo, "add", "tracked.txt")
+			gitSnapshot(t, repo, "commit", "-m", "reviewed candidate")
+
+			mirror := filepath.Join(repo, "openspec", "changes", "thin", "reviews", "receipt.json")
+			if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(mirror, tt.payload(t, receipt), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			got := EvaluateCompactGate(context.Background(), repo, receipt, NativeGateRequestInput{Gate: GatePostApply, LineageID: state.LineageID})
+			if got.Result == GateAllow {
+				t.Fatalf("mismatched change-local receipt mirror = %#v", got)
+			}
+		})
+	}
+}
+
 func TestCompactFixDiffUsesAuthoritativeCorrectionBindingAcrossDelivery(t *testing.T) {
 	t.Run("uncommitted pre-commit", func(t *testing.T) {
 		repo, state, receipt, _ := approvedCompactFixDiffFixture(t, "compact-fix-pre-commit")

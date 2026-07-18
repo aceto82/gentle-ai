@@ -23,7 +23,10 @@ type verifyCompletion struct {
 }
 
 type verifyResultEvaluation struct {
-	Passing          bool
+	Passing bool
+	// Stale marks evidence whose only defect is a totals mismatch against the
+	// current spec counts; failed verdicts, nonzero exits, and findings never are.
+	Stale            bool
 	Reason           string
 	EvidenceRevision string
 }
@@ -126,11 +129,14 @@ func parseVerifyResult(text string, expected SpecCounts) verifyResultEvaluation 
 		evaluation.Reason = "build_exit_code must be zero for archive readiness"
 		return evaluation
 	}
+	stale := verdict != "fail" && blockers == 0 && critical == 0
 	if requirements.Total != expected.Requirements {
+		evaluation.Stale = stale
 		evaluation.Reason = fmt.Sprintf("verify result total %d does not match actual requirement count %d", requirements.Total, expected.Requirements)
 		return evaluation
 	}
 	if scenarios.Total != expected.Scenarios {
+		evaluation.Stale = stale
 		evaluation.Reason = fmt.Sprintf("verify result total %d does not match actual scenario count %d", scenarios.Total, expected.Scenarios)
 		return evaluation
 	}

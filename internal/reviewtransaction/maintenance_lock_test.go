@@ -43,8 +43,12 @@ func TestMaintenanceLockModesAndRelease(t *testing.T) {
 	if err := exclusive.Release(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := acquireMaintenanceLock(context.Background(), path, maintenanceShared); err != nil {
+	reacquired, err := acquireMaintenanceLock(context.Background(), path, maintenanceShared)
+	if err != nil {
 		t.Fatalf("shared after release: %v", err)
+	}
+	if err := reacquired.Release(); err != nil {
+		t.Fatal(err)
 	}
 }
 

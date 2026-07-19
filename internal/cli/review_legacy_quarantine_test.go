@@ -83,7 +83,16 @@ func TestReviewQuarantineLegacyRestoresAuthoritativeInventory(t *testing.T) {
 	diagnostic := "historical findings freeze changed unrelated transaction state"
 	disposition := reviewtransaction.LegacyMalformedFreezeQuarantineDisposition
 	reason, actor := "retire malformed shipped legacy history", "maintainer@example.com"
-	authorization := "gentle-ai.review-legacy-quarantine-authorization/v1\nrepository=" + repo +
+	// The command derives the binding over the canonical repository root
+	// (filepath.Abs -> EvalSymlinks -> Clean). On Windows CI t.TempDir()
+	// yields 8.3 short-name components (e.g. RUNNER~1) that EvalSymlinks
+	// expands, so a binding built from the raw repo path would never match.
+	// Resolve the same canonical root the command uses.
+	repository, err := (reviewtransaction.SnapshotBuilder{Repo: repo}).ResolveRepositoryRoot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorization := "gentle-ai.review-legacy-quarantine-authorization/v1\nrepository=" + repository +
 		"\nlineage=" + lineage + "\nrevision=" + head + "\ndiagnostic=" + diagnostic +
 		"\ndisposition=" + disposition + "\nactor=" + actor + "\nreason=" + reason
 

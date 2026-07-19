@@ -116,15 +116,25 @@ func TestMalformedLegacyFreezeEventBricksInventoryWithNoFamilyExit(t *testing.T)
 	}
 }
 
-func malformedLegacyFreezeQuarantineRequest(repo, lineage, head string) LegacyQuarantineRequest {
+func malformedLegacyFreezeQuarantineRequest(t *testing.T, repo, lineage, head string) LegacyQuarantineRequest {
+	t.Helper()
 	request := LegacyQuarantineRequest{
 		LineageID: lineage, ExpectedRevision: head,
 		ExpectedDiagnostic: "historical findings freeze changed unrelated transaction state",
 		Disposition:        LegacyMalformedFreezeQuarantineDisposition,
 		Reason:             "retire malformed shipped legacy history", Actor: "maintainer@example.com",
 	}
+	// The command derives the authorization binding over the canonical
+	// repository root (filepath.Abs -> EvalSymlinks -> Clean). On Windows CI
+	// t.TempDir() yields 8.3 short-name components (e.g. RUNNER~1) that
+	// EvalSymlinks expands, so a binding built from the raw repo path would
+	// never match. Bind over the same canonical root the command uses.
+	_, repository, err := reviewAuthorityRoot(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
 	request.MaintainerAuthorization = legacyQuarantineAuthorizationBinding(
-		repo, request.LineageID, request.ExpectedRevision, request.ExpectedDiagnostic,
+		repository, request.LineageID, request.ExpectedRevision, request.ExpectedDiagnostic,
 		request.Disposition, request.Actor, request.Reason,
 	)
 	return request
@@ -134,7 +144,7 @@ func TestQuarantineMalformedLegacyFreezePreservesHistoryAndRestoresInventory(t *
 	repo := initSnapshotRepo(t)
 	approved, approvedStore := approvedCompactFixture(t, repo, "legacy-quarantine-unrelated-approved")
 	store, head, malformed := malformedLegacyFreezeFixture(t, repo, "legacy-freeze-broken")
-	request := malformedLegacyFreezeQuarantineRequest(repo, "legacy-freeze-broken", head)
+	request := malformedLegacyFreezeQuarantineRequest(t, repo, "legacy-freeze-broken", head)
 
 	headBytes, err := os.ReadFile(filepath.Join(store.Dir, "HEAD"))
 	if err != nil {
@@ -204,7 +214,7 @@ func TestQuarantineMalformedLegacyFreezeRefusesOutsideExactClass(t *testing.T) {
 	t.Run("stale revision", func(t *testing.T) {
 		repo := initSnapshotRepo(t)
 		store, head, _ := malformedLegacyFreezeFixture(t, repo, "legacy-freeze-stale")
-		request := malformedLegacyFreezeQuarantineRequest(repo, "legacy-freeze-stale", head)
+		request := malformedLegacyFreezeQuarantineRequest(t, repo, "legacy-freeze-stale", head)
 		request.ExpectedRevision = hash("f")
 		request.MaintainerAuthorization = legacyQuarantineAuthorizationBinding(
 			repo, request.LineageID, request.ExpectedRevision, request.ExpectedDiagnostic,
@@ -225,7 +235,7 @@ func TestQuarantineMalformedLegacyFreezeRefusesOutsideExactClass(t *testing.T) {
 			func(request *LegacyQuarantineRequest) { request.ExpectedDiagnostic = "different diagnostic" },
 			func(request *LegacyQuarantineRequest) { request.Disposition = "delete-history" },
 		} {
-			request := malformedLegacyFreezeQuarantineRequest(repo, "legacy-freeze-unsupported", head)
+			request := malformedLegacyFreezeQuarantineRequest(t, repo, "legacy-freeze-unsupported", head)
 			mutate(&request)
 			if _, err := QuarantineMalformedLegacyFreeze(context.Background(), repo, request); err == nil ||
 				!strings.Contains(err.Error(), "supports only") {
@@ -240,7 +250,7 @@ func TestQuarantineMalformedLegacyFreezeRefusesOutsideExactClass(t *testing.T) {
 	t.Run("inexact authorization", func(t *testing.T) {
 		repo := initSnapshotRepo(t)
 		store, head, _ := malformedLegacyFreezeFixture(t, repo, "legacy-freeze-auth")
-		request := malformedLegacyFreezeQuarantineRequest(repo, "legacy-freeze-auth", head)
+		request := malformedLegacyFreezeQuarantineRequest(t, repo, "legacy-freeze-auth", head)
 		request.MaintainerAuthorization += "\n"
 		if _, err := QuarantineMalformedLegacyFreeze(context.Background(), repo, request); err == nil ||
 			!strings.Contains(err.Error(), "exact maintainer authorization binding") {
@@ -261,7 +271,7 @@ func TestQuarantineMalformedLegacyFreezeRefusesOutsideExactClass(t *testing.T) {
 		if err := os.MkdirAll(compact.Dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		request := malformedLegacyFreezeQuarantineRequest(repo, "legacy-freeze-collision", head)
+		request := malformedLegacyFreezeQuarantineRequest(t, repo, "legacy-freeze-collision", head)
 		if _, err := QuarantineMalformedLegacyFreeze(context.Background(), repo, request); err == nil ||
 			!strings.Contains(err.Error(), "also exists in compact-v2") {
 			t.Fatalf("mixed identity error = %v", err)
@@ -279,7 +289,7 @@ func TestQuarantineMalformedLegacyFreezeRefusesOutsideExactClass(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer lock.release()
-		request := malformedLegacyFreezeQuarantineRequest(repo, "legacy-freeze-owned", head)
+		request := malformedLegacyFreezeQuarantineRequest(t, repo, "legacy-freeze-owned", head)
 		if _, err := QuarantineMalformedLegacyFreeze(context.Background(), repo, request); !errors.Is(err, ErrConcurrentUpdate) ||
 			!strings.Contains(err.Error(), "active ownership") {
 			t.Fatalf("active ownership error = %v", err)
@@ -312,7 +322,7 @@ func TestQuarantineMalformedLegacyFreezeRefusesOutsideExactClass(t *testing.T) {
 			Operation: "review/freeze-findings", PreviousRevision: genesis,
 			Transaction: historicalFreezeTransition(t, *tx),
 		})
-		request := malformedLegacyFreezeQuarantineRequest(repo, "legacy-freeze-valid", head)
+		request := malformedLegacyFreezeQuarantineRequest(t, repo, "legacy-freeze-valid", head)
 		if _, err := QuarantineMalformedLegacyFreeze(context.Background(), repo, request); err == nil ||
 			!strings.Contains(err.Error(), "no supported malformed findings-freeze event") {
 			t.Fatalf("valid legacy refusal = %v", err)

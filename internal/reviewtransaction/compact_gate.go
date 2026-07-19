@@ -143,8 +143,13 @@ func compactSquashedFixDelivery(gate GateKind, state CompactState, snapshot Snap
 }
 
 func EvaluateCompactGate(ctx context.Context, repo string, receipt CompactReceipt, input NativeGateRequestInput) NativeGateEvaluation {
+	return evaluateCompactGate(ctx, repo, receipt, input, false)
+}
+
+func evaluateCompactGate(ctx context.Context, repo string, receipt CompactReceipt, input NativeGateRequestInput, authorityLockHeld bool) NativeGateEvaluation {
+	var denialContext GateContext
 	invalid := func(reason string, cause ...error) NativeGateEvaluation {
-		return NativeGateEvaluation{Result: GateInvalidated, Reason: reason, Cause: errors.Join(cause...)}
+		return NativeGateEvaluation{Result: GateInvalidated, Reason: reason, Context: denialContext, Cause: errors.Join(cause...)}
 	}
 	if err := receipt.Validate(); err != nil {
 		return invalid("compact review receipt is invalid: " + err.Error())
@@ -154,18 +159,18 @@ func EvaluateCompactGate(ctx context.Context, repo string, receipt CompactReceip
 	}
 	store, err := CompactAuthoritativeStore(ctx, repo, receipt.LineageID)
 	if err != nil {
-		return invalid("compact review store cannot be derived: " + err.Error())
+		return invalid("compact review store cannot be derived: "+err.Error(), err)
 	}
 	record, err := store.Load()
 	if err != nil {
-		return invalid("compact review authority cannot be loaded: " + err.Error())
+		return invalid("compact review authority cannot be loaded: "+err.Error(), err)
 	}
 	if _, err := CompactAuthorityLeaves(ctx, repo); err != nil {
-		return invalid(err.Error())
+		return invalid(err.Error(), err)
 	}
 	superseded, err := CompactLineageSuperseded(ctx, repo, receipt.LineageID)
 	if err != nil {
-		return invalid(err.Error())
+		return invalid(err.Error(), err)
 	}
 	if superseded {
 		return invalid("compact receipt belongs to superseded historical authority")
@@ -177,7 +182,7 @@ func EvaluateCompactGate(ctx context.Context, repo string, receipt CompactReceip
 	// The findings are immutable once loaded; derive their ledger binding once
 	// so every context emitted below is consistent by construction.
 	ledgerHash := record.State.LedgerHash()
-	denialContext := GateContext{
+	denialContext = GateContext{
 		Gate: input.Gate, LineageID: receipt.LineageID, Generation: receipt.Generation,
 		StoreRevision: record.Revision, GenesisRevision: record.Revision, ChainIdentity: record.Revision, BundleDigest: record.Revision,
 		BaseTree: receipt.BaseTree, CandidateTree: receipt.FinalCandidateTree, PathsDigest: receipt.PathsDigest,
@@ -227,14 +232,19 @@ func EvaluateCompactGate(ctx context.Context, repo string, receipt CompactReceip
 		expectedIntended = nextSliceIntended
 	}
 	if (request.Gate == GatePostApply || request.Gate == GatePreCommit) && !equalStrings(request.Target.IntendedUntracked, expectedIntended) {
+		denialContext.Denial = &GateDenial{Stage: "scope-validation", Code: "intended-untracked-mismatch"}
 		return invalid("current repository target does not retain the authoritative intended-untracked paths")
 	}
 	if err := validateCompactUntrackedScope(ctx, repo, record.State, request); err != nil {
+		denialContext.Denial = &GateDenial{Stage: "scope-validation", Code: "untracked-out-of-scope"}
+		if compactGateInfrastructureFailure(err) {
+			return invalid(err.Error(), err)
+		}
 		return invalid(err.Error())
 	}
 	preimages, err := readGateArtifactPreimages(request)
 	if err != nil {
-		return invalid("compact gate evidence cannot be read: " + err.Error())
+		return invalid("compact gate evidence cannot be read: "+err.Error(), err)
 	}
 	if len(preimages.policy) > 0 && hashArtifactPayload(preimages.policy) != record.State.PolicyHash {
 		return invalid("explicit policy does not match compact authority")
@@ -260,6 +270,9 @@ func EvaluateCompactGate(ctx context.Context, repo string, receipt CompactReceip
 		record.State.InitialSnapshot.Kind == TargetBaseWorkspaceOverlay && (request.Gate == GatePrePush || request.Gate == GatePrePR)
 	if validatePublicationRange {
 		if err := validateReviewedPublicationRange(ctx, repo, record.State.GenesisPaths, resolvedPrePR); err != nil {
+			if compactGateInfrastructureFailure(err) {
+				return invalid(err.Error(), err)
+			}
 			return invalid(err.Error())
 		}
 	}
@@ -326,7 +339,7 @@ func EvaluateCompactGate(ctx context.Context, repo string, receipt CompactReceip
 		diagnostics, diagnosticsErr := buildCompactScopeChangeDiagnostics(ctx, repo, record.State, record.Revision, snapshot)
 		if diagnosticsErr != nil {
 			gateContext.Denial = &GateDenial{Stage: "receipt-binding", Code: "scope-diagnostics-unavailable"}
-			return NativeGateEvaluation{Result: GateInvalidated, Reason: "exact scope-change diagnostics cannot be derived: " + diagnosticsErr.Error(), Context: gateContext}
+			return NativeGateEvaluation{Result: GateInvalidated, Reason: "exact scope-change diagnostics cannot be derived: " + diagnosticsErr.Error(), Context: gateContext, Cause: diagnosticsErr}
 		}
 		gateContext.ScopeChange = &diagnostics
 		return NativeGateEvaluation{Result: GateScopeChanged, Reason: nativeGateReason(GateScopeChanged), Context: gateContext}
@@ -339,7 +352,7 @@ func EvaluateCompactGate(ctx context.Context, repo string, receipt CompactReceip
 	if request.Gate == GateRelease {
 		derived, releaseErr := deriveReleaseEvidence(ctx, repo, request.Release, preimages)
 		if releaseErr != nil {
-			return invalid("release evidence cannot be derived: " + releaseErr.Error())
+			return invalid("release evidence cannot be derived: "+releaseErr.Error(), releaseErr)
 		}
 		if derived.ReleaseTree != snapshot.CandidateTree {
 			return invalid("release evidence does not match the current candidate tree")
@@ -347,11 +360,13 @@ func EvaluateCompactGate(ctx context.Context, repo string, receipt CompactReceip
 		release = &derived
 	}
 	gateContext.Release = release
-	lock, lockErr := acquireStoreLock(store.lockPath)
-	if lockErr != nil {
-		return invalid("compact authority changed during final authorization")
+	if !authorityLockHeld {
+		lock, lockErr := acquireStoreLock(store.lockPath)
+		if lockErr != nil {
+			return invalid("compact authority changed during final authorization")
+		}
+		defer lock.release()
 	}
-	defer lock.release()
 	finalGateAuthorizationHook()
 	finalRecord, loadErr := store.Load()
 	finalSnapshot, finalRefs, snapshotErr := buildCompactLifecycleSnapshot(ctx, repo, request)
@@ -360,23 +375,43 @@ func EvaluateCompactGate(ctx context.Context, repo string, receipt CompactReceip
 	_, graphErr := CompactAuthorityLeaves(ctx, repo)
 	finalSuperseded, supersededErr := CompactLineageSuperseded(ctx, repo, receipt.LineageID)
 	if loadErr != nil || snapshotErr != nil || finalUntrackedErr != nil || finalTrackedErr != nil || graphErr != nil || supersededErr != nil || finalSuperseded || finalRecord.Revision != record.Revision || !reflect.DeepEqual(finalSnapshot, snapshot) || !sameResolvedPrePRRefs(finalRefs, resolvedPrePR) {
-		return invalid("compact authority or repository target changed during final authorization")
+		cause := errors.Join(loadErr, snapshotErr, finalUntrackedErr, finalTrackedErr, graphErr, supersededErr)
+		if cause == nil {
+			cause = ErrConcurrentUpdate
+		}
+		return invalid("compact authority or repository target changed during final authorization", cause)
 	}
 	if recoveryRebind != nil {
 		finalChain, ok, chainErr := deriveCompactRecoveryBinding(ctx, repo, finalRecord.State)
 		if chainErr != nil || !ok || !reflect.DeepEqual(finalChain, *recoveryRebind) {
-			return invalid("compact authority or repository target changed during final authorization")
+			if chainErr == nil {
+				chainErr = ErrConcurrentUpdate
+			}
+			return invalid("compact authority or repository target changed during final authorization", chainErr)
 		}
 	}
 	if request.Gate == GateRelease {
 		finalPreimages, preimageErr := readGateArtifactPreimages(request)
 		finalRelease, releaseErr := deriveReleaseEvidence(ctx, repo, request.Release, finalPreimages)
 		if preimageErr != nil || releaseErr != nil || release == nil || finalRelease != *release {
-			return invalid("release evidence changed during final authorization")
+			cause := errors.Join(preimageErr, releaseErr)
+			if cause == nil {
+				cause = ErrConcurrentUpdate
+			}
+			return invalid("release evidence changed during final authorization", cause)
 		}
 	}
 	finalCompactGateAllowHook()
 	return NativeGateEvaluation{Result: GateAllow, Reason: nativeGateReason(GateAllow), Context: gateContext}
+}
+
+func compactGateInfrastructureFailure(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var command *GitCommandError
+	var processControl *GitProcessControlError
+	return errors.As(err, &command) || errors.As(err, &processControl)
 }
 
 func buildCompactScopeChangeDiagnostics(ctx context.Context, repo string, state CompactState, revision string, actual Snapshot) (GateScopeChangeDiagnostics, error) {

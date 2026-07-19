@@ -25,34 +25,35 @@ const (
 )
 
 type CompactState struct {
-	Schema                    string                     `json:"schema"`
-	LineageID                 string                     `json:"lineage_id"`
-	Generation                int                        `json:"generation"`
-	State                     State                      `json:"state"`
-	InitialSnapshot           Snapshot                   `json:"initial_snapshot"`
-	CurrentSnapshot           Snapshot                   `json:"current_snapshot"`
-	GenesisPaths              []string                   `json:"genesis_paths"`
-	PolicyHash                string                     `json:"policy_hash"`
-	RiskLevel                 RiskLevel                  `json:"risk_level"`
-	SelectedLenses            []string                   `json:"selected_lenses"`
-	OriginalChangedLines      int                        `json:"original_changed_lines"`
-	CorrectionBudget          int                        `json:"correction_budget"`
-	LensResults               []LensResult               `json:"lens_results"`
-	Findings                  []Finding                  `json:"findings"`
-	Classifications           map[string]FindingEvidence `json:"classifications"`
-	Outcomes                  map[string]EvidenceOutcome `json:"outcomes"`
-	FixFindingIDs             []string                   `json:"fix_finding_ids"`
-	FollowUps                 []FollowUp                 `json:"follow_ups"`
-	ProposedCorrectionLines   *int                       `json:"proposed_correction_lines,omitempty"`
-	ActualCorrectionLines     *int                       `json:"actual_correction_lines,omitempty"`
-	FixDeltaHash              string                     `json:"fix_delta_hash"`
-	OriginalCriteria          *ValidationCheck           `json:"original_criteria,omitempty"`
-	CorrectionRegression      *ValidationCheck           `json:"correction_regression,omitempty"`
-	EvidenceHash              string                     `json:"evidence_hash,omitempty"`
-	InvalidationReason        string                     `json:"invalidation_reason,omitempty"`
-	Recovery                  *CompactRecoveryProvenance `json:"recovery,omitempty"`
-	CorrectionAttempts        []CompactCorrectionAttempt `json:"correction_attempts,omitempty"`
-	CumulativeCorrectionLines int                        `json:"cumulative_correction_lines,omitempty"`
+	Schema                    string                       `json:"schema"`
+	LineageID                 string                       `json:"lineage_id"`
+	Generation                int                          `json:"generation"`
+	State                     State                        `json:"state"`
+	InitialSnapshot           Snapshot                     `json:"initial_snapshot"`
+	CurrentSnapshot           Snapshot                     `json:"current_snapshot"`
+	GenesisPaths              []string                     `json:"genesis_paths"`
+	PolicyHash                string                       `json:"policy_hash"`
+	RiskLevel                 RiskLevel                    `json:"risk_level"`
+	SelectedLenses            []string                     `json:"selected_lenses"`
+	OriginalChangedLines      int                          `json:"original_changed_lines"`
+	CorrectionBudget          int                          `json:"correction_budget"`
+	LensResults               []LensResult                 `json:"lens_results"`
+	Findings                  []Finding                    `json:"findings"`
+	Classifications           map[string]FindingEvidence   `json:"classifications"`
+	Outcomes                  map[string]EvidenceOutcome   `json:"outcomes"`
+	FixFindingIDs             []string                     `json:"fix_finding_ids"`
+	FollowUps                 []FollowUp                   `json:"follow_ups"`
+	ProposedCorrectionLines   *int                         `json:"proposed_correction_lines,omitempty"`
+	ActualCorrectionLines     *int                         `json:"actual_correction_lines,omitempty"`
+	FixDeltaHash              string                       `json:"fix_delta_hash"`
+	OriginalCriteria          *ValidationCheck             `json:"original_criteria,omitempty"`
+	CorrectionRegression      *ValidationCheck             `json:"correction_regression,omitempty"`
+	EvidenceHash              string                       `json:"evidence_hash,omitempty"`
+	InvalidationReason        string                       `json:"invalidation_reason,omitempty"`
+	InvalidationEvidence      *CompactInvalidationEvidence `json:"invalidation_evidence,omitempty"`
+	Recovery                  *CompactRecoveryProvenance   `json:"recovery,omitempty"`
+	CorrectionAttempts        []CompactCorrectionAttempt   `json:"correction_attempts,omitempty"`
+	CumulativeCorrectionLines int                          `json:"cumulative_correction_lines,omitempty"`
 }
 
 type CompactCorrectionAttempt struct {
@@ -62,6 +63,12 @@ type CompactCorrectionAttempt struct {
 	FixDeltaHash         string          `json:"fix_delta_hash"`
 	OriginalCriteria     ValidationCheck `json:"original_criteria"`
 	CorrectionRegression ValidationCheck `json:"correction_regression"`
+}
+
+type CompactInvalidationEvidence struct {
+	Gate    GateKind    `json:"gate"`
+	Reason  string      `json:"reason"`
+	Context GateContext `json:"context"`
 }
 
 type RecoveryDisposition string
@@ -170,6 +177,25 @@ func (state CompactState) Validate() error {
 		default:
 			return errors.New("compact recovery disposition is invalid")
 		}
+	}
+	if state.State != StateInvalidated && state.InvalidationEvidence != nil {
+		return errors.New("only an invalidated compact state may contain invalidation evidence")
+	}
+	if state.State == StateInvalidated && strings.TrimSpace(state.InvalidationReason) != "" && state.InvalidationEvidence != nil {
+		evidence := state.InvalidationEvidence
+		payload, err := json.Marshal(evidence.Context)
+		parsed, parseErr := ParseGateContext(payload)
+		if err != nil || parseErr != nil || !reflect.DeepEqual(parsed, evidence.Context) || evidence.Gate != evidence.Context.Gate ||
+			evidence.Reason != state.InvalidationReason || evidence.Context.LineageID != state.LineageID || evidence.Context.Generation != state.Generation {
+			return errors.New("approved compact invalidation evidence is incomplete or invalid")
+		}
+		approved := state
+		approved.State, approved.InvalidationReason, approved.InvalidationEvidence = StateApproved, "", nil
+		approvedRecord, _, recordErr := makeCompactRecord(approved)
+		if approved.Validate() == nil && recordErr == nil && evidence.Context.StoreRevision == approvedRecord.Revision {
+			return nil
+		}
+		return errors.New("approved compact invalidation evidence does not bind its predecessor revision")
 	}
 	if err := validateSnapshot(state.InitialSnapshot); err != nil {
 		return fmt.Errorf("initial snapshot: %w", err)
@@ -658,6 +684,22 @@ func (state *CompactState) Invalidate(reason string) error {
 	}
 	state.State, state.InvalidationReason = StateInvalidated, reason
 	return nil
+}
+
+func (state *CompactState) invalidateApproved(evaluation NativeGateEvaluation) error {
+	reason := strings.TrimSpace(evaluation.Reason)
+	if reason == "" {
+		return errors.New("approved invalidation reason is required")
+	}
+	if evaluation.Result != GateInvalidated {
+		return fmt.Errorf("approved invalidation requires an invalidated gate result, got %q", evaluation.Result)
+	}
+	if state.State != StateApproved {
+		return fmt.Errorf("cannot invalidate approved authority from compact state %q", state.State)
+	}
+	state.State, state.InvalidationReason = StateInvalidated, reason
+	state.InvalidationEvidence = &CompactInvalidationEvidence{Gate: evaluation.Context.Gate, Reason: reason, Context: evaluation.Context}
+	return state.Validate()
 }
 
 func compactPristineReviewing(state CompactState) bool {

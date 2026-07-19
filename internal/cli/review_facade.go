@@ -579,11 +579,20 @@ func runReviewBindSDD(ctx context.Context, args []string, stdout io.Writer) erro
 }
 
 func RunReviewInvalidate(args []string, stdout io.Writer) error {
-	flags := newReviewFlagSet("review invalidate", stdout, "Terminally invalidate one explicit pristine reviewing authority.")
+	flags := newReviewFlagSet("review invalidate", stdout, "Terminally invalidate one explicit pristine reviewing authority, or an approved compact authority whose lifecycle gate natively re-derives invalidated under LOCK.")
 	cwd := flags.String("cwd", "", "repository path")
 	lineage := flags.String("lineage", "", "explicit review lineage identifier")
 	expected := flags.String("expected-revision", "", "exact current authority revision")
-	reason := flags.String("reason", "", "non-empty terminal invalidation reason")
+	reason := flags.String("reason", "", "non-empty terminal invalidation reason for a pristine reviewing authority")
+	gate := flags.String("gate", "", "approved-authority lifecycle gate: post-apply, pre-commit, pre-push, pre-pr, or release")
+	baseRef := flags.String("base-ref", "", "optional expected remote publication base for pre-push or pre-pr")
+	ciAttestation := flags.String("pre-pr-ci-attestation", "", "signed exact-merged-tree CI attestation for a compatible base advance")
+	policy := flags.String("policy", "", "explicit custom policy containing compatible-base CI trust")
+	releaseConfiguration := flags.String("release-configuration", "", "release configuration artifact")
+	releaseGenerated := flags.String("release-generated", "", "generated artifact manifest")
+	releaseProvenance := flags.String("release-provenance", "", "release provenance artifact")
+	releaseBoundary := flags.String("release-publication-boundary", "", "sealed publication boundary artifact")
+	releaseFreshness := flags.String("release-evidence-freshness", "", "current release evidence freshness artifact")
 	if err := parseReviewFlags(flags, args); err != nil {
 		return err
 	}
@@ -593,8 +602,8 @@ func RunReviewInvalidate(args []string, stdout io.Writer) error {
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected review invalidate argument %q", flags.Arg(0))
 	}
-	if strings.TrimSpace(*cwd) == "" || strings.TrimSpace(*lineage) == "" || strings.TrimSpace(*expected) == "" || strings.TrimSpace(*reason) == "" {
-		return errors.New("review invalidate requires --cwd, --lineage, --expected-revision, and --reason")
+	if strings.TrimSpace(*cwd) == "" || strings.TrimSpace(*lineage) == "" || strings.TrimSpace(*expected) == "" {
+		return errors.New("review invalidate requires --cwd, --lineage, and --expected-revision")
 	}
 	root, err := (reviewtransaction.SnapshotBuilder{Repo: *cwd}).ResolveRepositoryRoot(context.Background())
 	if err != nil {
@@ -612,6 +621,32 @@ func RunReviewInvalidate(args []string, stdout io.Writer) error {
 				return errors.New("review authority is ambiguous across compact v2 and legacy v1 stores")
 			}
 		}
+		approvedInvalidation := record.State.State == reviewtransaction.StateApproved ||
+			record.State.State == reviewtransaction.StateInvalidated && record.State.InvalidationEvidence != nil
+		if approvedInvalidation {
+			if strings.TrimSpace(*gate) == "" {
+				return errors.New("approved review invalidation requires --gate")
+			}
+			input := reviewtransaction.NativeGateRequestInput{
+				Gate: reviewtransaction.GateKind(*gate), LineageID: *lineage, BaseRef: *baseRef,
+				PrePRCIAttestation: *ciAttestation, ReleaseConfiguration: *releaseConfiguration,
+				ReleaseGenerated: *releaseGenerated, ReleaseProvenance: *releaseProvenance,
+				ReleasePublicationBoundary: *releaseBoundary, ReleaseEvidenceFreshness: *releaseFreshness,
+			}
+			if strings.TrimSpace(*ciAttestation) != "" {
+				input.PolicyArtifact = *policy
+			}
+			invalidated, _, err := reviewtransaction.InvalidateApprovedCompactAuthority(context.Background(), root, reviewtransaction.CompactApprovedInvalidationRequest{
+				LineageID: *lineage, ExpectedRevision: *expected, Gate: input,
+			})
+			if err != nil {
+				return err
+			}
+			return encodeReviewJSON(stdout, ReviewInvalidateResult{Operation: "review/invalidate", LineageID: invalidated.State.LineageID, State: invalidated.State.State, StoreRevision: invalidated.Revision})
+		}
+		if strings.TrimSpace(*reason) == "" {
+			return errors.New("pristine review invalidation requires --reason")
+		}
 		state := record.State
 		if state.State != reviewtransaction.StateInvalidated || state.InvalidationReason != strings.TrimSpace(*reason) {
 			if err := state.Invalidate(*reason); err != nil {
@@ -626,6 +661,9 @@ func RunReviewInvalidate(args []string, stdout io.Writer) error {
 	}
 	if !errors.Is(loadErr, os.ErrNotExist) {
 		return fmt.Errorf("load explicit compact review lineage: %w", loadErr)
+	}
+	if strings.TrimSpace(*reason) == "" {
+		return errors.New("legacy review invalidation requires --reason")
 	}
 	legacy, err := reviewtransaction.AuthoritativeStore(context.Background(), root, *lineage)
 	if err != nil {

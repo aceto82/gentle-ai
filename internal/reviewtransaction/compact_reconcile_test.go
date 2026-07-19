@@ -79,6 +79,25 @@ func reconcileFixtureRequest(predecessor, successor CompactRecord) CompactReconc
 	return request
 }
 
+func combinedRecoveryFixture(t *testing.T, repo string, mutate func(*CompactState)) (CompactRecord, CompactStore, CompactRecord, CompactStore) {
+	t.Helper()
+	return poisonedRecoveryFixture(t, repo, func(state *CompactState) {
+		state.Recovery.MaintainerAuthorization = preContractFixtureAuthorization
+		if mutate != nil {
+			mutate(state)
+		}
+	})
+}
+
+func combinedReconcileFixtureRequest(predecessor, successor CompactRecord) CompactReconcileRequest {
+	request := reconcileFixtureRequest(predecessor, successor)
+	request.Reason = "quarantine combined recovery anomalies"
+	request.MaintainerAuthorization = compactReconcileAuthorizationBinding(
+		request.PredecessorLineageID, predecessor.Revision, request.SuccessorLineageID, successor.Revision,
+		request.Actor, request.Reason) + "\nanomalies=unchanged_target,malformed_recovery_authorization"
+	return request
+}
+
 func TestReconcileInvalidRecoveryEdgeQuarantinesSuccessorAndRestoresAuthority(t *testing.T) {
 	repo := initSnapshotRepo(t)
 	predecessor, predecessorStore, successor, successorStore := poisonedRecoveryFixture(t, repo, nil)
@@ -176,6 +195,143 @@ func TestReconcileInvalidRecoveryEdgeQuarantinesSuccessorAndRestoresAuthority(t 
 	if err != nil || started.Action != CompactStartRecover || started.Record.State.LineageID != predecessor.State.LineageID {
 		t.Fatalf("post-reconcile lineage-less start = %#v, %v", started, err)
 	}
+}
+
+func TestReconcileCombinedRecoveryAnomaliesQuarantinesWithBothProofsAndRestoresAuthority(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	predecessor, predecessorStore, successor, successorStore := combinedRecoveryFixture(t, repo, nil)
+	if _, err := CompactAuthorityLeaves(context.Background(), repo); err == nil || !strings.Contains(err.Error(), "target has not changed") {
+		t.Fatalf("combined-anomaly graph leaves error = %v", err)
+	}
+	predecessorStateBefore, err := os.ReadFile(predecessorStore.StatePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	successorPayload, err := os.ReadFile(successorStore.StatePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := combinedReconcileFixtureRequest(predecessor, successor)
+	record, err := ReconcileInvalidRecoveryEdge(context.Background(), repo, request)
+	if err != nil {
+		t.Fatalf("reconcile combined recovery anomalies: %v", err)
+	}
+	if record.Status != CompactReclaimCommitted || record.InvalidRecoveryEdge == nil ||
+		!strings.Contains(record.InvalidRecoveryEdge.ValidationError, "target has not changed") {
+		t.Fatalf("combined unchanged-target proof = %#v", record.InvalidRecoveryEdge)
+	}
+	recordedDigest := sha256.Sum256([]byte(preContractFixtureAuthorization))
+	if record.MalformedRecoveryAuthorization == nil ||
+		record.MalformedRecoveryAuthorization.RecordedAuthorizationSHA256 != "sha256:"+hex.EncodeToString(recordedDigest[:]) ||
+		!strings.Contains(record.MalformedRecoveryAuthorization.ValidationError, "exact maintainer authorization binding") {
+		t.Fatalf("combined malformed-authorization proof = %#v", record.MalformedRecoveryAuthorization)
+	}
+	moved, err := os.ReadFile(filepath.Join(record.QuarantinePath, "residue", "review-state.json"))
+	if err != nil || !bytes.Equal(moved, successorPayload) {
+		t.Fatalf("quarantined combined successor bytes = %q, %v", moved, err)
+	}
+	persistedPayload, err := os.ReadFile(filepath.Join(record.QuarantinePath, "reclaim-record.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted CompactReclaimRecord
+	if err := json.Unmarshal(persistedPayload, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.InvalidRecoveryEdge == nil || persisted.MalformedRecoveryAuthorization == nil ||
+		persisted.MalformedRecoveryAuthorization.RecordedAuthorizationSHA256 != record.MalformedRecoveryAuthorization.RecordedAuthorizationSHA256 {
+		t.Fatalf("persisted combined audit record = %#v", persisted)
+	}
+	predecessorStateAfter, err := os.ReadFile(predecessorStore.StatePath())
+	if err != nil || !bytes.Equal(predecessorStateBefore, predecessorStateAfter) {
+		t.Fatal("combined reconcile changed predecessor authority bytes")
+	}
+	leaves, err := CompactAuthorityLeaves(context.Background(), repo)
+	if err != nil || len(leaves) != 1 || leaves[0].lineageID != predecessor.State.LineageID {
+		t.Fatalf("post-combined-reconcile leaves = %#v, %v", leaves, err)
+	}
+	writeSnapshotFile(t, repo, "tracked.txt", "post-combined-repair target\n")
+	started, err := StartCompactAuthority(context.Background(), repo, CompactStartRequest{State: newCompactTestState(t, repo, "reconcile-combined-fresh")})
+	if err != nil || started.Action != CompactStartRecover || started.Record.State.LineageID != predecessor.State.LineageID {
+		t.Fatalf("post-combined-reconcile start = %#v, %v", started, err)
+	}
+}
+
+func TestReconcileCombinedRecoveryAnomaliesRefusesWithoutMutation(t *testing.T) {
+	assertUntouched := func(t *testing.T, repo string, store CompactStore, payload []byte) {
+		t.Helper()
+		current, err := os.ReadFile(store.StatePath())
+		if err != nil || !bytes.Equal(current, payload) {
+			t.Fatalf("refused combined reconcile mutated successor bytes: %v", err)
+		}
+		root, _, err := reviewAuthorityRoot(context.Background(), repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries, err := os.ReadDir(filepath.Join(root, "quarantine"))
+		if err == nil && len(entries) != 0 {
+			t.Fatalf("refused combined reconcile left quarantine entries: %#v", entries)
+		}
+	}
+
+	t.Run("binding omits combined anomaly set", func(t *testing.T) {
+		repo := initSnapshotRepo(t)
+		predecessor, _, successor, successorStore := combinedRecoveryFixture(t, repo, nil)
+		payload, _ := os.ReadFile(successorStore.StatePath())
+		request := combinedReconcileFixtureRequest(predecessor, successor)
+		request.MaintainerAuthorization = compactReconcileAuthorizationBinding(
+			request.PredecessorLineageID, predecessor.Revision, request.SuccessorLineageID, successor.Revision,
+			request.Actor, request.Reason)
+		if _, err := ReconcileInvalidRecoveryEdge(context.Background(), repo, request); err == nil || !strings.Contains(err.Error(), "exact maintainer authorization binding") {
+			t.Fatalf("inexact combined binding error = %v", err)
+		}
+		assertUntouched(t, repo, successorStore, payload)
+	})
+
+	t.Run("declared classification changed", func(t *testing.T) {
+		repo := initSnapshotRepo(t)
+		predecessor, _, successor, successorStore := combinedRecoveryFixture(t, repo, func(state *CompactState) {
+			writeSnapshotFile(t, repo, "tracked.txt", "changed combined target\n")
+			changed := newCompactTestState(t, repo, state.LineageID)
+			state.InitialSnapshot = changed.InitialSnapshot
+			state.CurrentSnapshot = changed.CurrentSnapshot
+			state.GenesisPaths = changed.GenesisPaths
+		})
+		payload, _ := os.ReadFile(successorStore.StatePath())
+		if _, err := ReconcileInvalidRecoveryEdge(context.Background(), repo, combinedReconcileFixtureRequest(predecessor, successor)); err == nil || !strings.Contains(err.Error(), "exact maintainer authorization binding") {
+			t.Fatalf("changed combined classification error = %v", err)
+		}
+		assertUntouched(t, repo, successorStore, payload)
+	})
+
+	t.Run("stale successor revision", func(t *testing.T) {
+		repo := initSnapshotRepo(t)
+		predecessor, _, successor, successorStore := combinedRecoveryFixture(t, repo, nil)
+		payload, _ := os.ReadFile(successorStore.StatePath())
+		request := combinedReconcileFixtureRequest(predecessor, successor)
+		request.ExpectedSuccessorRevision = predecessor.Revision
+		if _, err := ReconcileInvalidRecoveryEdge(context.Background(), repo, request); !errors.Is(err, ErrConcurrentUpdate) {
+			t.Fatalf("stale combined revision error = %v", err)
+		}
+		assertUntouched(t, repo, successorStore, payload)
+	})
+
+	t.Run("unrelated graph defect", func(t *testing.T) {
+		repo := initSnapshotRepo(t)
+		predecessor, _, successor, successorStore := combinedRecoveryFixture(t, repo, nil)
+		payload, _ := os.ReadFile(successorStore.StatePath())
+		root, _, err := reviewAuthorityRoot(context.Background(), repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeReclaimFixtureFile(t, filepath.Join(root, "v2", "reconcile-unrelated", "review-state.json"), "not json\n")
+		if _, err := ReconcileInvalidRecoveryEdge(context.Background(), repo, combinedReconcileFixtureRequest(predecessor, successor)); err == nil ||
+			!strings.Contains(err.Error(), `related compact authority "reconcile-unrelated" does not load`) {
+			t.Fatalf("unrelated combined graph defect error = %v", err)
+		}
+		assertUntouched(t, repo, successorStore, payload)
+	})
 }
 
 func TestReconcileInvalidRecoveryEdgeRefusesIneligibleTargetsAndBindings(t *testing.T) {

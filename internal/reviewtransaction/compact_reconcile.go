@@ -14,6 +14,7 @@ import (
 )
 
 const compactReconcileAuthorizationSchema = "gentle-ai.review-reconcile-authorization/v1"
+const compactCombinedRecoveryAnomalies = "unchanged_target,malformed_recovery_authorization"
 
 // CompactReconcileRequest identifies one recovery successor whose persisted
 // recovery edge must natively re-derive as invalid before quarantine, together
@@ -57,11 +58,16 @@ func compactReconcileAuthorizationBinding(predecessorLineage, predecessorRevisio
 		"\nactor=" + strings.TrimSpace(actor) + "\nreason=" + strings.TrimSpace(reason)
 }
 
+func compactCombinedReconcileAuthorizationBinding(predecessorLineage, predecessorRevision, successorLineage, successorRevision, actor, reason string) string {
+	return compactReconcileAuthorizationBinding(predecessorLineage, predecessorRevision, successorLineage, successorRevision, actor, reason) +
+		"\nanomalies=" + compactCombinedRecoveryAnomalies
+}
+
 // ReconcileInvalidRecoveryEdge quarantines one compact-v2 recovery successor
-// whose recovery edge natively re-derives as invalid for exactly one of two
-// supported classes: the unchanged-target class, and the pre-contract
-// malformed-recovery-authorization class in which a historical free-form
-// maintainer authorization predates the exact
+// whose recovery edge natively re-derives as invalid for either or both of two
+// supported classes: the unchanged-target class, and the pre-contract malformed-
+// recovery-authorization class in which a historical free-form maintainer
+// authorization predates the exact
 // gentle-ai.review-recovery-authorization/v1 binding while the edge is
 // otherwise structurally consistent. The predecessor and every unrelated
 // authority stay untouched; the successor entry moves whole — never deleted —
@@ -122,25 +128,43 @@ func ReconcileInvalidRecoveryEdge(ctx context.Context, repo string, request Comp
 	if successor.Revision != request.ExpectedSuccessorRevision {
 		return CompactReclaimRecord{}, fmt.Errorf("%w: expected successor revision %q, current %q", ErrConcurrentUpdate, request.ExpectedSuccessorRevision, successor.Revision)
 	}
-	if request.MaintainerAuthorization != compactReconcileAuthorizationBinding(request.PredecessorLineageID, predecessor.Revision, request.SuccessorLineageID, successor.Revision, request.Actor, request.Reason) {
-		return CompactReclaimRecord{}, fmt.Errorf("review reconcile-authority requires an exact maintainer authorization binding (schema %s over predecessor %s@%s and successor %s@%s)",
-			compactReconcileAuthorizationSchema, request.PredecessorLineageID, predecessor.Revision, request.SuccessorLineageID, successor.Revision)
-	}
 	edgeErr := validateCompactRecoveryEdge(predecessor, successor.State)
 	if edgeErr == nil {
 		return CompactReclaimRecord{}, fmt.Errorf("review reconcile-authority refused: recovery edge for %q validates; the successor remains authoritative", request.SuccessorLineageID)
 	}
 	exactRecordedBinding := compactRecoveryAuthorizationBinding(predecessor.State.LineageID, predecessor.Revision, successor.State.InitialSnapshot.Identity, recovery.Actor, recovery.Reason)
+	expectedReconcileAuthorization := compactReconcileAuthorizationBinding(
+		request.PredecessorLineageID, predecessor.Revision, request.SuccessorLineageID, successor.Revision,
+		request.Actor, request.Reason)
 	var invalidEdgeProof *CompactInvalidRecoveryEdgeProof
 	var malformedAuthorizationProof *CompactMalformedRecoveryAuthorizationProof
 	switch {
 	case errors.Is(edgeErr, errCompactRecoveryTargetUnchanged):
-		if recovery.MaintainerAuthorization != exactRecordedBinding {
-			return CompactReclaimRecord{}, errors.New("review reconcile-authority refused: unchanged target is not the sole anomaly; the recorded recovery authorization binding is inexact")
-		}
 		invalidEdgeProof = &CompactInvalidRecoveryEdgeProof{
 			PredecessorLineageID: request.PredecessorLineageID, PredecessorRevision: predecessor.Revision,
 			SuccessorRevision: successor.Revision, ValidationError: edgeErr.Error(),
+		}
+		if recovery.MaintainerAuthorization != exactRecordedBinding {
+			if strings.HasPrefix(recovery.MaintainerAuthorization, compactRecoveryAuthorizationSchema) {
+				return CompactReclaimRecord{}, fmt.Errorf("review reconcile-authority refused: unchanged target is not the sole anomaly; successor %q records a %s binding bound to different content, which is corruption rather than a pre-contract authorization", request.SuccessorLineageID, compactRecoveryAuthorizationSchema)
+			}
+			repaired := successor.State
+			provenance := *recovery
+			provenance.MaintainerAuthorization = exactRecordedBinding
+			repaired.Recovery = &provenance
+			if residualErr := validateCompactRecoveryEdge(predecessor, repaired); !errors.Is(residualErr, errCompactRecoveryTargetUnchanged) {
+				return CompactReclaimRecord{}, fmt.Errorf("review reconcile-authority refused: combined recovery anomalies do not re-derive exactly: %v", residualErr)
+			}
+			recorded := sha256.Sum256([]byte(recovery.MaintainerAuthorization))
+			malformedAuthorizationProof = &CompactMalformedRecoveryAuthorizationProof{
+				PredecessorLineageID: request.PredecessorLineageID, PredecessorRevision: predecessor.Revision,
+				SuccessorRevision:           successor.Revision,
+				RecordedAuthorizationSHA256: "sha256:" + hex.EncodeToString(recorded[:]),
+				ValidationError:             compactRecoveryAuthorizationError(successor.State.InitialSnapshot).Error(),
+			}
+			expectedReconcileAuthorization = compactCombinedReconcileAuthorizationBinding(
+				request.PredecessorLineageID, predecessor.Revision, request.SuccessorLineageID, successor.Revision,
+				request.Actor, request.Reason)
 		}
 	case errors.Is(edgeErr, errCompactRecoveryAuthorizationInexact):
 		if strings.HasPrefix(recovery.MaintainerAuthorization, compactRecoveryAuthorizationSchema) {
@@ -162,6 +186,10 @@ func ReconcileInvalidRecoveryEdge(ctx context.Context, repo string, request Comp
 		}
 	default:
 		return CompactReclaimRecord{}, fmt.Errorf("review reconcile-authority refused: recovery edge fails outside the unchanged-target class and the pre-contract authorization class: %v", edgeErr)
+	}
+	if request.MaintainerAuthorization != expectedReconcileAuthorization {
+		return CompactReclaimRecord{}, fmt.Errorf("review reconcile-authority requires an exact maintainer authorization binding (schema %s over predecessor %s@%s and successor %s@%s)",
+			compactReconcileAuthorizationSchema, request.PredecessorLineageID, predecessor.Revision, request.SuccessorLineageID, successor.Revision)
 	}
 	stores, err := DiscoverCompactStores(ctx, repo)
 	if err != nil {

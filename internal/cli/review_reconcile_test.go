@@ -43,9 +43,9 @@ func writeReconcileCLIRecord(t *testing.T, repo string, state reviewtransaction.
 }
 
 // invalidRecoveryEdgeCLIFixture persists an escalated docs-only predecessor
-// with its receipt and a recovery successor whose sole anomaly is an unchanged
-// target, then restores the clean workspace.
-func invalidRecoveryEdgeCLIFixture(t *testing.T, repo string) (predecessorRevision, successorRevision string) {
+// with its receipt and an unchanged-target recovery successor, then restores
+// the clean workspace. recoveryAuthorization can add the pre-contract anomaly.
+func invalidRecoveryEdgeCLIFixture(t *testing.T, repo, recoveryAuthorization string) (predecessorRevision, successorRevision string) {
 	t.Helper()
 	incident := filepath.Join(repo, "docs", "incident.md")
 	if err := os.MkdirAll(filepath.Dir(incident), 0o755); err != nil {
@@ -102,6 +102,9 @@ func invalidRecoveryEdgeCLIFixture(t *testing.T, repo string) (predecessorRevisi
 			"\npredecessor_revision=" + predecessorRevision + "\ntarget_identity=" + successorState.InitialSnapshot.Identity +
 			"\nactor=maintainer@example.com\nreason=retry after escalation",
 	}
+	if recoveryAuthorization != "" {
+		successorState.Recovery.MaintainerAuthorization = recoveryAuthorization
+	}
 	successorRevision = writeReconcileCLIRecord(t, repo, successorState)
 	if err := os.Remove(incident); err != nil {
 		t.Fatal(err)
@@ -125,10 +128,15 @@ func reconcileCLIBinding(predecessorRevision, successorRevision string) string {
 		"\nactor=maintainer@example.com\nreason=quarantine invalid unchanged-target recovery edge"
 }
 
+func combinedReconcileCLIBinding(predecessorRevision, successorRevision string) string {
+	return reconcileCLIBinding(predecessorRevision, successorRevision) +
+		"\nanomalies=unchanged_target,malformed_recovery_authorization"
+}
+
 func TestReviewReconcileAuthorityQuarantinesInvalidEdgeAndRestoresDiscovery(t *testing.T) {
 	repo := initReviewCLIRepo(t)
 	approveDiscoveryMarkdown(t, repo, "review-reconcile-valid", "docs/valid.md", "valid\n")
-	predecessorRevision, successorRevision := invalidRecoveryEdgeCLIFixture(t, repo)
+	predecessorRevision, successorRevision := invalidRecoveryEdgeCLIFixture(t, repo, "")
 
 	var statusOutput bytes.Buffer
 	if err := RunReview([]string{"status", "--cwd", repo}, &statusOutput); err != nil {
@@ -196,6 +204,30 @@ func TestReviewReconcileAuthorityQuarantinesInvalidEdgeAndRestoresDiscovery(t *t
 
 	if err := RunReview(reconcileCLIArgs(repo, predecessorRevision, successorRevision, reconcileCLIBinding(predecessorRevision, successorRevision)), &bytes.Buffer{}); err == nil {
 		t.Fatal("review reconcile-authority replayed after quarantine")
+	}
+}
+
+func TestReviewReconcileAuthorityQuarantinesCombinedRecoveryAnomalies(t *testing.T) {
+	repo := initReviewCLIRepo(t)
+	const recordedAuthorization = "maintainer approved incident retry per the 2.1.6 runbook"
+	predecessorRevision, successorRevision := invalidRecoveryEdgeCLIFixture(t, repo, recordedAuthorization)
+
+	var output bytes.Buffer
+	if err := RunReview(reconcileCLIArgs(repo, predecessorRevision, successorRevision, combinedReconcileCLIBinding(predecessorRevision, successorRevision)), &output); err != nil {
+		t.Fatalf("review reconcile-authority combined repair: %v\n%s", err, output.String())
+	}
+	var result ReviewReconcileAuthorityResult
+	decodeStrictReviewJSON(t, output.Bytes(), &result)
+	if result.Record.Status != reviewtransaction.CompactReclaimCommitted || result.Record.InvalidRecoveryEdge == nil ||
+		result.Record.MalformedRecoveryAuthorization == nil {
+		t.Fatalf("combined reconcile result = %#v", result)
+	}
+	recordedDigest := sha256.Sum256([]byte(recordedAuthorization))
+	if result.Record.MalformedRecoveryAuthorization.RecordedAuthorizationSHA256 != "sha256:"+hex.EncodeToString(recordedDigest[:]) {
+		t.Fatalf("combined authorization digest = %q", result.Record.MalformedRecoveryAuthorization.RecordedAuthorizationSHA256)
+	}
+	if _, err := os.Stat(filepath.Join(result.Record.QuarantinePath, "residue", "review-state.json")); err != nil {
+		t.Fatalf("combined quarantined successor state missing: %v", err)
 	}
 }
 
@@ -390,7 +422,7 @@ func TestReviewReconcileAuthorityRepairsPreContractAuthorizationAndRestoresLifec
 
 func TestReviewReconcileAuthorityRequiresFlagsAndExactBinding(t *testing.T) {
 	repo := initReviewCLIRepo(t)
-	predecessorRevision, successorRevision := invalidRecoveryEdgeCLIFixture(t, repo)
+	predecessorRevision, successorRevision := invalidRecoveryEdgeCLIFixture(t, repo, "")
 	statePath := filepath.Join(reviewCLIAuthorityRoot(t, repo), "v2", "reconcile-incident-g2", "review-state.json")
 	payload, err := os.ReadFile(statePath)
 	if err != nil {

@@ -436,6 +436,141 @@ func TestUnscopedGateDiscoveryToleratesCorruptedUnrelatedLegacyInventory(t *test
 	}
 }
 
+func TestReleaseGateToleratesCorruptionConfinedToLegacyEntriesIncludingLockResidue(t *testing.T) {
+	repo := initReviewCLIRepo(t)
+	started, _ := approveDiscoveryMarkdown(t, repo, "review-release-tolerance", "docs/valid.md", "valid\n")
+	runReviewCLIGit(t, repo, "add", "-A")
+	runReviewCLIGit(t, repo, "commit", "-qm", "deliver reviewed candidate")
+
+	evidenceDir := t.TempDir()
+	releaseArgs := []string{}
+	for _, artifact := range [][2]string{
+		{"--release-configuration", "release configuration\n"},
+		{"--release-generated", "generated manifest\n"},
+		{"--release-provenance", "release provenance\n"},
+		{"--release-publication-boundary", "sealed publication boundary\n"},
+		{"--release-evidence-freshness", "current release evidence\n"},
+	} {
+		path := filepath.Join(evidenceDir, strings.TrimPrefix(artifact[0], "--"))
+		if err := os.WriteFile(path, []byte(artifact[1]), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		releaseArgs = append(releaseArgs, artifact[0], path)
+	}
+	validateRelease := func() (*bytes.Buffer, error) {
+		var output bytes.Buffer
+		err := RunReview(append([]string{
+			"validate", "--contract", ReviewIntegrationContractV1, "--cwd", repo,
+			"--gate", string(reviewtransaction.GateRelease),
+		}, releaseArgs...), &output)
+		return &output, err
+	}
+
+	control, err := validateRelease()
+	if err != nil {
+		t.Fatalf("healthy release-gate control denied: %v\n%s", err, control.String())
+	}
+
+	commonDir := filepath.Clean(strings.TrimSpace(runReviewCLIGit(t, repo, "rev-parse", "--path-format=absolute", "--git-common-dir")))
+	legacyBroken := filepath.Join(commonDir, "gentle-ai", "review-transactions", "v1", "legacy-alias-broken")
+	if err := os.MkdirAll(legacyBroken, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyBroken, "HEAD"), []byte("not-a-revision\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyBroken, "LOCK"), []byte("not-json\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := reviewtransaction.InventoryAuthority(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Complete || report.Authoritative {
+		t.Fatalf("legacy lock residue fixture left the inventory authoritative = %#v", report)
+	}
+	invalidLegacy, ambiguousLegacyLock := false, false
+	for _, entry := range report.Entries {
+		if entry.LineageID == "legacy-alias-broken" && entry.Version == reviewtransaction.AuthorityVersionLegacy && entry.Status == reviewtransaction.AuthorityStatusInvalid {
+			invalidLegacy = true
+		}
+	}
+	for _, lock := range report.Locks {
+		if lock.LineageID == "legacy-alias-broken" && lock.Version == reviewtransaction.AuthorityVersionLegacy && lock.Status == reviewtransaction.AuthorityLockAmbiguous {
+			ambiguousLegacyLock = true
+		}
+	}
+	if !invalidLegacy || !ambiguousLegacyLock {
+		t.Fatalf("fixture did not confine ambiguous lock residue to an invalid legacy entry: entries=%#v locks=%#v", report.Entries, report.Locks)
+	}
+
+	tolerated, err := validateRelease()
+	if err != nil {
+		t.Fatalf("release gate denied corruption confined to legacy entries: %v\n%s", err, tolerated.String())
+	}
+	var result ReviewValidateResult
+	decodeStrictReviewJSON(t, decodeReviewOperationEnvelope(t, tolerated.Bytes()).Result, &result)
+	if !result.Allowed || result.Context.LineageID != started.LineageID {
+		t.Fatalf("release gate across legacy-confined corruption = %#v", result)
+	}
+	incompleteCompact := filepath.Join(commonDir, "gentle-ai", "review-transactions", "v2", "compact-incomplete")
+	if err := os.MkdirAll(incompleteCompact, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	incompleteDenied, err := validateRelease()
+	if err == nil {
+		t.Fatalf("legacy lock masked an independent incomplete compact-v2 entry:\n%s", incompleteDenied.String())
+	}
+	if err := os.Remove(incompleteCompact); err != nil {
+		t.Fatal(err)
+	}
+	brokenHead, err := os.ReadFile(filepath.Join(legacyBroken, "HEAD"))
+	if err != nil || string(brokenHead) != "not-a-revision\n" {
+		t.Fatalf("release validation mutated legacy residue head: %v", err)
+	}
+	brokenLock, err := os.ReadFile(filepath.Join(legacyBroken, "LOCK"))
+	if err != nil || string(brokenLock) != "not-json\n" {
+		t.Fatalf("release validation mutated legacy lock residue: %v", err)
+	}
+
+	sharedLock := filepath.Join(commonDir, "gentle-ai", "review-transactions", "v2", "LOCK")
+	originalSharedLock, err := os.ReadFile(sharedLock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sharedLock, []byte("not-json\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sharedDenied, err := validateRelease()
+	if err == nil {
+		t.Fatalf("shared compact-v2 ambiguous lock was tolerated at the release gate:\n%s", sharedDenied.String())
+	}
+	sharedFailure := decodeReviewIntegrationFailure(t, sharedDenied.Bytes())
+	if sharedFailure.Code != "authority_corrupted" || sharedFailure.AuthorityApplicability != "corrupted" || sharedFailure.CauseCategory != "lock_ambiguous" {
+		t.Fatalf("shared ambiguous lock failure = %#v", sharedFailure)
+	}
+	if err := os.WriteFile(sharedLock, originalSharedLock, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	compactBroken := filepath.Join(commonDir, "gentle-ai", "review-transactions", "v2", "compact-broken")
+	if err := os.MkdirAll(compactBroken, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(compactBroken, "review-state.json"), []byte("{\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	compactDenied, err := validateRelease()
+	if err == nil {
+		t.Fatalf("live compact corruption was tolerated at the release gate:\n%s", compactDenied.String())
+	}
+	compactFailure := decodeReviewIntegrationFailure(t, compactDenied.Bytes())
+	if compactFailure.Code != "authority_corrupted" || compactFailure.AuthorityApplicability != "corrupted" || compactFailure.CauseCategory != "record_or_graph_invalid" {
+		t.Fatalf("live compact corruption failure = %#v", compactFailure)
+	}
+}
+
 func TestUnscopedGateDiscoveryExcludesTamperedLegacyReceiptFromCandidates(t *testing.T) {
 	repo := initReviewCLIRepo(t)
 	started, _ := approveDiscoveryMarkdown(t, repo, "review-discovery-valid", "docs/valid.md", "valid\n")

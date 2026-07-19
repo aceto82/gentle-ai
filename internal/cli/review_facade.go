@@ -1507,15 +1507,17 @@ func discoverCompactFacadeGateReview(ctx context.Context, repo, lineage string, 
 
 // reviewAuthorityCorruptionConfinedToLegacyEntries reports whether every cause
 // of a non-authoritative inventory is an invalid legacy-v1 entry, which can
-// never resolve as a compact discovery candidate. Inventory IO/layout
-// diagnostics, ambiguous locks, reset residue, mixed-store collisions, and any
-// compact-v2 problem keep lineage-less discovery fail-closed.
+// never resolve as a compact discovery candidate. Ambiguous lock residue is
+// tolerated only when it belongs to such an already-invalid legacy entry;
+// inventory IO/layout diagnostics, shared or live-entry ambiguous locks, reset
+// residue, mixed-store collisions, and any compact-v2 problem keep
+// lineage-less discovery fail-closed.
 func reviewAuthorityCorruptionConfinedToLegacyEntries(report reviewtransaction.AuthorityStatusReport, inventoryErr error) bool {
 	if inventoryErr != nil || len(report.Diagnostics) > 0 {
 		return false
 	}
 	for _, lock := range report.Locks {
-		if lock.Status == reviewtransaction.AuthorityLockAmbiguous {
+		if lock.Status == reviewtransaction.AuthorityLockAmbiguous && !reviewAmbiguousLockConfinedToInvalidLegacyEntry(report, lock) {
 			return false
 		}
 	}
@@ -1527,11 +1529,29 @@ func reviewAuthorityCorruptionConfinedToLegacyEntries(report reviewtransaction.A
 				return false
 			}
 			confined = true
-		case reviewtransaction.AuthorityStatusReset, reviewtransaction.AuthorityStatusCollision:
+		case reviewtransaction.AuthorityStatusIncomplete, reviewtransaction.AuthorityStatusReset, reviewtransaction.AuthorityStatusCollision:
 			return false
 		}
 	}
 	return confined
+}
+
+// reviewAmbiguousLockConfinedToInvalidLegacyEntry reports whether ambiguous
+// lock evidence is part of the corruption of a legacy-v1 lineage entry that
+// the inventory has already classified invalid. Only that residue is confined:
+// the shared compact-v2 store lock carries no owning lineage, and any lock
+// attached to a live, historical, collided, or missing entry stays a
+// fail-closed corruption cause because it may still guard real authority.
+func reviewAmbiguousLockConfinedToInvalidLegacyEntry(report reviewtransaction.AuthorityStatusReport, lock reviewtransaction.AuthorityLockEvidence) bool {
+	if lock.Version != reviewtransaction.AuthorityVersionLegacy || strings.TrimSpace(lock.LineageID) == "" {
+		return false
+	}
+	for _, entry := range report.Entries {
+		if entry.Version == reviewtransaction.AuthorityVersionLegacy && entry.LineageID == lock.LineageID {
+			return entry.Status == reviewtransaction.AuthorityStatusInvalid
+		}
+	}
+	return false
 }
 
 func reviewAuthorityCauseCategory(report reviewtransaction.AuthorityStatusReport, inventoryErr error) string {
@@ -1539,7 +1559,7 @@ func reviewAuthorityCauseCategory(report reviewtransaction.AuthorityStatusReport
 		return "inventory_io_or_layout"
 	}
 	for _, lock := range report.Locks {
-		if lock.Status == reviewtransaction.AuthorityLockAmbiguous {
+		if lock.Status == reviewtransaction.AuthorityLockAmbiguous && !reviewAmbiguousLockConfinedToInvalidLegacyEntry(report, lock) {
 			return "lock_ambiguous"
 		}
 	}

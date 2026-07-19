@@ -539,7 +539,7 @@ func Inject(homeDir string, adapter agents.Adapter, sddMode model.SDDModeID, opt
 					return InjectionResult{}, fmt.Errorf("clean stale profile JD agents %q: %w", profile.Name, cleanupErr)
 				}
 				changed = changed || cleanupResult.Changed
-				profileOverlay, profileErr := GenerateProfileOverlay(profile, homeDir, opts.CodeGraphGuidanceMarkdown)
+				profileOverlay, profileErr := GenerateProfileOverlay(profile, homeDir, opts.OpenCodeModelAssignments, opts.CodeGraphGuidanceMarkdown)
 				if profileErr != nil {
 					return InjectionResult{}, fmt.Errorf("generate profile overlay %q: %w", profile.Name, profileErr)
 				}

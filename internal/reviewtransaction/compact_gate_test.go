@@ -770,6 +770,76 @@ func TestCompactPrePRGateAllowsFinalSubsetOfGenesisPaths(t *testing.T) {
 	}
 }
 
+func TestValidateCompactPublicationRangeAllowsRepeatedApprovedPath(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	base := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD"))
+	writeSnapshotFile(t, repo, "tracked.txt", "red\n")
+	gitSnapshot(t, repo, "add", "tracked.txt")
+	gitSnapshot(t, repo, "commit", "-m", "red")
+	writeSnapshotFile(t, repo, "tracked.txt", "green\n")
+	gitSnapshot(t, repo, "add", "tracked.txt")
+	gitSnapshot(t, repo, "commit", "-m", "green")
+	head := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD"))
+
+	err := validateCompactPublicationRange(context.Background(), repo, []string{"tracked.txt"}, &resolvedPrePRRefs{
+		BaseCommit: base,
+		HeadCommit: head,
+	})
+	if err != nil {
+		t.Fatalf("repeated approved publication path: %v", err)
+	}
+}
+
+func TestValidateCompactPublicationRangeRejectsHiddenAddedAndRevertedPath(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	base := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD"))
+	writeSnapshotFile(t, repo, "secret.txt", "hidden\n")
+	gitSnapshot(t, repo, "add", "secret.txt")
+	gitSnapshot(t, repo, "commit", "-m", "add hidden path")
+	if err := os.Remove(filepath.Join(repo, "secret.txt")); err != nil {
+		t.Fatal(err)
+	}
+	gitSnapshot(t, repo, "add", "-A")
+	gitSnapshot(t, repo, "commit", "-m", "revert hidden path")
+	head := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD"))
+
+	err := validateCompactPublicationRange(context.Background(), repo, []string{"tracked.txt"}, &resolvedPrePRRefs{
+		BaseCommit: base,
+		HeadCommit: head,
+	})
+	if err == nil || !strings.Contains(err.Error(), `correction path "secret.txt" is outside immutable genesis scope`) {
+		t.Fatalf("hidden added and reverted publication path error = %v", err)
+	}
+}
+
+func TestValidateCompactPublicationRangeAllowsRepeatedApprovedPathAcrossMergeHistory(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "approved.txt", "first\nsecond\nthird\nfourth\nfifth\n")
+	gitSnapshot(t, repo, "add", "approved.txt")
+	gitSnapshot(t, repo, "commit", "-m", "add approved path")
+	base := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD"))
+	branch := currentBranch(context.Background(), repo)
+
+	gitSnapshot(t, repo, "checkout", "-qb", "merge-side")
+	writeSnapshotFile(t, repo, "approved.txt", "first\nsecond\nthird\nfourth\nside\n")
+	gitSnapshot(t, repo, "add", "approved.txt")
+	gitSnapshot(t, repo, "commit", "-m", "side approved change")
+	gitSnapshot(t, repo, "checkout", "-q", branch)
+	writeSnapshotFile(t, repo, "approved.txt", "main\nsecond\nthird\nfourth\nfifth\n")
+	gitSnapshot(t, repo, "add", "approved.txt")
+	gitSnapshot(t, repo, "commit", "-m", "main approved change")
+	gitSnapshot(t, repo, "merge", "--no-edit", "merge-side")
+	head := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD"))
+
+	err := validateCompactPublicationRange(context.Background(), repo, []string{"approved.txt"}, &resolvedPrePRRefs{
+		BaseCommit: base,
+		HeadCommit: head,
+	})
+	if err != nil {
+		t.Fatalf("repeated approved merge-history path: %v", err)
+	}
+}
+
 func TestCompactPrePushAllowsCurrentChangesWithoutTransientCorrectionBaseCommit(t *testing.T) {
 	repo, state, receipt, baseRef := approvedCompactSubsetDeliveryFixture(t, "compact-subset-pre-push")
 	got := EvaluateCompactGate(context.Background(), repo, receipt, NativeGateRequestInput{Gate: GatePrePush, LineageID: state.LineageID, BaseRef: baseRef})

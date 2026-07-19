@@ -11,6 +11,12 @@ import (
 	"testing"
 )
 
+func TestCanonicalPathsRejectsDuplicateInput(t *testing.T) {
+	if _, err := canonicalPaths([]string{"tracked.txt", "tracked.txt"}); err == nil {
+		t.Fatal("canonicalPaths duplicate input error = nil")
+	}
+}
+
 func TestSnapshotBuilderCurrentChangesIsCompleteAndPreservesRealIndex(t *testing.T) {
 	if testing.Short() {
 		t.Skip("uses real git commands")

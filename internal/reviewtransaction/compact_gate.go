@@ -487,10 +487,16 @@ func validateCompactPublicationRange(ctx context.Context, repo string, genesis [
 		return fmt.Errorf("inspect complete publication range: %w", err)
 	}
 	paths := []string{}
+	seen := map[string]struct{}{}
 	for _, path := range strings.Split(string(output), "\x00") {
-		if path != "" {
-			paths = append(paths, path)
+		if path == "" {
+			continue
 		}
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
 	}
 	paths, err = canonicalPaths(paths)
 	if err == nil {

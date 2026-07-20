@@ -169,7 +169,7 @@ Native Windsurf Workflow: `/sdd-new` is also available as a native Windsurf work
 
 ### Execution Mode
 
-When the user invokes `/sdd-new`, `/sdd-ff`, or `/sdd-continue` (or an equivalent natural-language request, e.g. "haceme un SDD para X" / "do SDD for X") for the first time in a session, ASK which execution mode they prefer:
+When the user invokes `/sdd-new`, `/sdd-ff`, or `/sdd-continue` (or an equivalent natural-language request, e.g. "create an SDD for X" / "do SDD for X") for the first time in a session, ASK which execution mode they prefer:
 
 - **Automatic** (`auto`): Run all phases sequentially without pausing. Phases still run sequentially WITHOUT interrupting the user, BUT the orchestrator runs a gatekeeper validation after every phase before advancing — the user only sees an interruption when the gatekeeper catches a real problem. Otherwise only the final result is shown. Use this when the user wants speed and trusts the process.
 - **Interactive** (`interactive`): After each phase completes, show the result summary and ASK: "Want to adjust anything or continue?" before proceeding to the next phase. Use this when the user wants to review and steer each step.

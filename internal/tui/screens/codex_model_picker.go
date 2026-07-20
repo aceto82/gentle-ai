@@ -544,7 +544,7 @@ func codexModelSearchDisplay(query string) string {
 // Labels are self-describing: they include the model id and effort tier per
 // carril so the user can see what will be written to profile files.
 //
-// All presets also set the main orchestrator to gpt-5.6-sol/low.
+// All presets also set the main orchestrator to gpt-5.6-sol/medium.
 // Format: "<Plan> — Orquestador <model>/<effort> · Razonamiento <model>/<effort> · Código <model>/<effort> · Liviano <model>/<effort>"
 func CodexPresetLabel(preset CodexModelPreset) string {
 	defaults := model.CodexPresetCarrilDefaults(string(preset))

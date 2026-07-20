@@ -106,13 +106,17 @@ type CodexOrchestratorAssignment struct {
 }
 
 // CodexPresetOrchestratorAssignment returns the main-session policy for a
-// named preset. All curated presets keep orchestration responsive at low effort.
-// Unknown keys intentionally fall back to Recommended.
+// named preset. All curated presets share one orchestration policy: the
+// main session runs at medium effort. The orchestrator plans, routes and
+// adjudicates rather than doing the delegated work, so low effort made it
+// the weakest link in the chain; medium keeps it responsive while giving it
+// enough reasoning to route correctly. Unknown keys intentionally fall back
+// to Recommended.
 func CodexPresetOrchestratorAssignment(preset string) *CodexOrchestratorAssignment {
 	if _, ok := codexPresetMatrix[CodexPresetKey(preset)]; !ok {
 		preset = string(CodexPresetRecommended)
 	}
-	return &CodexOrchestratorAssignment{Model: "gpt-5.6-sol", Effort: CodexEffortLow}
+	return &CodexOrchestratorAssignment{Model: "gpt-5.6-sol", Effort: CodexEffortMedium}
 }
 
 // CodexPresetCarrilDefaults returns a defensive copy of the selected preset's

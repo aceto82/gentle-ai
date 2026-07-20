@@ -617,11 +617,11 @@ func checkCarrilRowModel(t *testing.T, table string, profile string, wantModel s
 	}
 }
 
-func TestCodexPresetOrchestratorAssignment_AllPresetsUseSolLow(t *testing.T) {
+func TestCodexPresetOrchestratorAssignment_AllPresetsUseSolMedium(t *testing.T) {
 	for _, preset := range []model.CodexPresetKey{model.CodexPresetLowCost, model.CodexPresetRecommended, model.CodexPresetPowerful} {
 		a := model.CodexPresetOrchestratorAssignment(string(preset))
-		if a.Model != "gpt-5.6-sol" || a.Effort != model.CodexEffortLow {
-			t.Errorf("preset %q orchestrator = %s/%s, want gpt-5.6-sol/low", preset, a.Model, a.Effort)
+		if a.Model != "gpt-5.6-sol" || a.Effort != model.CodexEffortMedium {
+			t.Errorf("preset %q orchestrator = %s/%s, want gpt-5.6-sol/medium", preset, a.Model, a.Effort)
 		}
 	}
 }

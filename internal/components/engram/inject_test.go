@@ -2261,7 +2261,7 @@ func TestInjectCodexOrchestratorAssignmentWritesTopLevelModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(content)
-	if !strings.Contains(text, `model = "gpt-5.6-sol"`) || !strings.Contains(text, `model_reasoning_effort = "low"`) {
+	if !strings.Contains(text, `model = "gpt-5.6-sol"`) || !strings.Contains(text, `model_reasoning_effort = "medium"`) {
 		t.Fatalf("top-level orchestrator assignment missing:\n%s", text)
 	}
 }

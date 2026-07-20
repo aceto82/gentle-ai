@@ -144,7 +144,7 @@ Kiro uses native custom agents in `~/.kiro/agents/`. `gentle-ai` writes phase ag
 - MCP servers (Engram and Context7) are upserted as `[mcp_servers.<name>]` blocks in `~/.codex/config.toml`
 - SDD model-selection profiles written as separate files at `~/.codex/<name>.config.toml`. GPT-5.6 defaults require Codex >= 0.144.0 (the separate-file mechanism itself is available since 0.134.0). Select a profile at runtime via `codex --profile <name>`:
 
-  Model and effort defaults vary together by preset. These effort levels are Gentle AI workload policy, not Codex defaults. Every curated preset also assigns the main orchestrator/session to `gpt-5.6-sol` / `low`; Custom and legacy state preserve existing top-level settings:
+  Model and effort defaults vary together by preset. These effort levels are Gentle AI workload policy, not Codex defaults. Every curated preset also assigns the main orchestrator/session to `gpt-5.6-sol` / `medium`; Custom and legacy state preserve existing top-level settings:
 
   | Profile | Low-cost | Recommended | Powerful | SDD phases |
   |---------|----------|-------------|----------|------------|

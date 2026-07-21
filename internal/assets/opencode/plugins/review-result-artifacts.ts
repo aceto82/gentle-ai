@@ -3,6 +3,7 @@ import { spawn } from "node:child_process"
 
 const REVIEW_AGENTS = new Set(["review-risk", "review-resilience", "review-readability", "review-reliability"])
 const BINDING = /^GENTLE_AI_REVIEW_BINDING (\{[^\n]+\})(?:\n|$)/
+const FROZEN_CONTEXT = "GENTLE_AI_FROZEN_CANDIDATE_CONTEXT "
 const TASK_RESULT = /^<task id="[^"\r\n]+" state="completed">\n<task_result>\n([\s\S]*?)\n<\/task_result>\n<\/task>$/
 const TASK_TAG = /<\/?task(?:\s|>)|<\/?task_result>/
 
@@ -14,6 +15,16 @@ type ReviewBinding = {
   revision?: string
   repository_context?: string
   subject_hash?: string
+}
+
+interface ReviewArtifactSubject {
+  subject_hash: string
+}
+
+interface ReviewCapturePreflight {
+  artifact_subject: ReviewArtifactSubject
+  candidate_diff: Record<string, unknown>
+  changed_path_manifest: Array<Record<string, unknown>>
 }
 
 function parseBinding(prompt: unknown, lens: string): ReviewBinding {
@@ -32,14 +43,15 @@ function parseBinding(prompt: unknown, lens: string): ReviewBinding {
   const value = binding as Record<string, unknown>
   const fields = Object.keys(value).sort().join(",")
   const legacy = fields === "lens,lineage,order,target"
+  const legacyBound = fields === "lens,lineage,order,subject_hash,target"
   const priorCurrent = fields === "lens,lineage,order,repository_context,revision,target"
   const current = fields === "lens,lineage,order,repository_context,revision,subject_hash,target"
-  if ((!legacy && !priorCurrent && !current) ||
+  if ((!legacy && !legacyBound && !priorCurrent && !current) ||
       typeof value.lineage !== "string" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value.lineage) ||
       typeof value.target !== "string" || !/^sha256:[a-f0-9]{64}$/.test(value.target) ||
       ((priorCurrent || current) && (typeof value.revision !== "string" || !/^sha256:[a-f0-9]{64}$/.test(value.revision) ||
         typeof value.repository_context !== "string" || !/^rctx1_[a-f0-9]{64}$/.test(value.repository_context))) ||
-      (current && (typeof value.subject_hash !== "string" || !/^sha256:[a-f0-9]{64}$/.test(value.subject_hash))) ||
+      ((legacyBound || current) && (typeof value.subject_hash !== "string" || !/^sha256:[a-f0-9]{64}$/.test(value.subject_hash))) ||
       value.lens !== lens || !Number.isSafeInteger(value.order) || (value.order as number) < 0) {
     throw new Error("review task binding does not match the selected lens")
   }
@@ -109,32 +121,40 @@ function captureResult(cwd: string, binding: ReviewBinding, result: string): Pro
   ], result)
 }
 
-async function preflightCapture(cwd: string, binding: ReviewBinding): Promise<void> {
+async function preflightCapture(cwd: string, binding: ReviewBinding): Promise<ReviewCapturePreflight | undefined> {
   try {
     const response = await runNative(cwd, [
       "review", "capture-result", ...repositoryBindingArgs(cwd, binding),
       "--lineage", binding.lineage, "--target", binding.target,
       "--lens", binding.lens, "--order", String(binding.order), "--preflight",
     ], "")
-    if (binding.subject_hash) {
-      let subjectHash: unknown
-      try {
-        const parsed = JSON.parse(response) as { artifact_subject?: { subject_hash?: unknown } }
-        subjectHash = parsed?.artifact_subject?.subject_hash
-      } catch {
-        throw new Error("review capture preflight returned malformed artifact-subject JSON")
-      }
-      if (subjectHash !== binding.subject_hash) {
-        throw new Error("review capture preflight returned a different artifact subject")
-      }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(response)
+    } catch {
+      throw new Error("review capture preflight returned malformed artifact-subject JSON")
     }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("review capture preflight returned malformed artifact-subject JSON")
+    }
+    const value = parsed as Record<string, unknown>
+    const subject = value.artifact_subject as Record<string, unknown> | undefined
+    if (!subject || typeof subject.subject_hash !== "string" || !/^sha256:[a-f0-9]{64}$/.test(subject.subject_hash) ||
+        !value.candidate_diff || typeof value.candidate_diff !== "object" || Array.isArray(value.candidate_diff) ||
+        !Array.isArray(value.changed_path_manifest) || value.changed_path_manifest.some((entry) => !entry || typeof entry !== "object" || Array.isArray(entry))) {
+      throw new Error("review capture preflight returned incomplete frozen candidate context")
+    }
+    if (binding.subject_hash && subject.subject_hash !== binding.subject_hash) {
+      throw new Error("review capture preflight returned a different artifact subject")
+    }
+    return value as unknown as ReviewCapturePreflight
   } catch (cause) {
     // An older installed gentle-ai binary rejects the flag itself ("flag
     // provided but not defined: -preflight"). That is version skew, not a
     // binding problem: degrade gracefully and let the real capture path
     // behave exactly as it did before preflight existed.
     const message = errorMessage(cause)
-    if (message.includes("flag provided but not defined") && message.includes("-preflight")) return
+    if (message.includes("flag provided but not defined") && message.includes("-preflight")) return undefined
     const scope = binding.repository_context ? "the provider-issued repository context" : cwd
     const recovery = binding.repository_context
       ? `Refresh the exact native next_transition for lineage ${binding.lineage} before relaunching the lens.`
@@ -147,6 +167,20 @@ async function preflightCapture(cwd: string, binding: ReviewBinding): Promise<vo
       recovery,
     )
   }
+}
+
+async function injectReviewerContext(prompt: string, lens: string, cwd: string): Promise<string> {
+  const binding = parseBinding(prompt, lens)
+  const preflight = await preflightCapture(cwd, binding)
+  if (!preflight) return prompt
+  const injectedBinding = { ...binding, subject_hash: preflight.artifact_subject.subject_hash }
+  const boundPrompt = prompt.replace(BINDING, `GENTLE_AI_REVIEW_BINDING ${JSON.stringify(injectedBinding)}\n`)
+  const frozen = JSON.stringify({
+    artifact_subject: preflight.artifact_subject,
+    candidate_diff: preflight.candidate_diff,
+    changed_path_manifest: preflight.changed_path_manifest,
+  })
+  return `${boundPrompt.trimEnd()}\n${FROZEN_CONTEXT}${frozen}`
 }
 
 function preserveResult(cwd: string, binding: ReviewBinding, raw: string, cls?: string): Promise<string> {
@@ -223,7 +257,11 @@ const ReviewResultArtifactsPlugin: Plugin = async ({ directory, worktree }) => (
     if (output.args.background === true) {
       throw new Error("bound review tasks must run in the foreground for native result capture")
     }
-    await preflightCapture(captureCwd(worktree, directory), parseBinding(output.args.prompt, output.args.subagent_type))
+    output.args.prompt = await injectReviewerContext(
+      output.args.prompt,
+      output.args.subagent_type,
+      captureCwd(worktree, directory),
+    )
   },
   "tool.execute.after": async (input, output) => {
     if (input.tool !== "task" || typeof input.args?.subagent_type !== "string" || !REVIEW_AGENTS.has(input.args.subagent_type)) return

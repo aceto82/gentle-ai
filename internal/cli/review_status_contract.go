@@ -394,11 +394,21 @@ func (result ReviewTargetStatusResult) validateNextTransitionTargets() error {
 			continue
 		}
 		arguments, err := reviewTransitionArgumentMap(input.Arguments)
-		if err != nil || arguments["target"] != result.Projection.InitialSnapshotIdentity {
+		if err != nil || arguments["target"] != result.Projection.InitialSnapshotIdentity || input.ArtifactSubject == nil ||
+			input.ArtifactSubject.TargetIdentity != result.Projection.InitialSnapshotIdentity || input.ChangedPathManifest == nil ||
+			!reflect.DeepEqual(manifestPathsForStatus(*input.ChangedPathManifest), result.Projection.Paths) {
 			return errors.New("negotiated status capture target differs from the frozen target identity")
 		}
 	}
 	return nil
+}
+
+func manifestPathsForStatus(entries []reviewtransaction.ChangedPathManifestEntry) []string {
+	paths := make([]string, len(entries))
+	for index, entry := range entries {
+		paths[index] = entry.Path
+	}
+	return paths
 }
 
 func reviewStatusPathsContain(candidate, correction []string) bool {
@@ -451,9 +461,23 @@ func (transition ReviewNextTransition) Validate() error {
 				order, orderErr := strconv.Atoi(arguments["order"])
 				if len(arguments) != 6 || !reviewStartSupportedLens(arguments["lens"]) || orderErr != nil || order < 0 ||
 					!validReviewCapabilitySHA256(arguments["expected-revision"]) || !validReviewCapabilitySHA256(arguments["target"]) ||
-					strings.TrimSpace(arguments["lineage"]) == "" || reviewtransaction.ValidateReviewRepositoryContextHandle(arguments["repository-context"]) != nil {
+					strings.TrimSpace(arguments["lineage"]) == "" || reviewtransaction.ValidateReviewRepositoryContextHandle(arguments["repository-context"]) != nil ||
+					input.ArtifactSubject == nil || input.CandidateDiff == nil || input.ChangedPathManifest == nil {
 					return errors.New("review capture transition lacks an exact repository and authority binding")
 				}
+				subject := input.ArtifactSubject
+				manifestDigest, manifestErr := reviewtransaction.ChangedPathManifestDigest(*input.ChangedPathManifest)
+				if reviewtransaction.ValidateArtifactSubject(*subject) != nil || manifestErr != nil ||
+					subject.LineageID != arguments["lineage"] || subject.AuthorityRevision != arguments["expected-revision"] ||
+					subject.TargetIdentity != arguments["target"] || subject.Lens != arguments["lens"] || subject.SelectedOrder != order ||
+					subject.CandidateDiffSHA256 != input.CandidateDiff.SHA256 || subject.ChangedPathManifestSHA256 != manifestDigest {
+					return errors.New("review capture transition frozen subject or candidate context is invalid")
+				}
+				if _, err := input.CandidateDiff.Bytes(); err != nil {
+					return errors.New("review capture transition candidate diff is invalid")
+				}
+			} else if input.ArtifactSubject != nil || input.CandidateDiff != nil || input.ChangedPathManifest != nil {
+				return errors.New("non-reviewer collection transition contains frozen reviewer context")
 			}
 			if input.CaptureOperation == "external.run_targeted_validation" && input.ValidationRequest == nil {
 				return errors.New("targeted validation transition lacks its provider-owned request")

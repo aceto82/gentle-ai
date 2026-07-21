@@ -82,6 +82,15 @@ func TestAdmitArtifactRequiresCompletedBoundInScopeInspection(t *testing.T) {
 		{name: "out of scope proof", mutate: func(r *ArtifactAdmissionRequest) {
 			r.Result.Findings[0].ProofRefs = []string{"diff: unrelated/old.go:3"}
 		}, decision: ArtifactAdmissionOutOfScope},
+		{name: "root path evidence outside scope", mutate: func(r *ArtifactAdmissionRequest) {
+			r.Result.Evidence = append(r.Result.Evidence, "diff: secret.go:42")
+		}, decision: ArtifactAdmissionOutOfScope},
+		{name: "root path proof outside scope", mutate: func(r *ArtifactAdmissionRequest) {
+			r.Result.Findings[0].ProofRefs = []string{"diff: secret.go:42"}
+		}, decision: ArtifactAdmissionOutOfScope},
+		{name: "non ASCII finding id", mutate: func(r *ArtifactAdmissionRequest) {
+			r.Result.Findings[0].ID = "R3-é"
+		}, decision: ArtifactAdmissionBindingMismatch},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

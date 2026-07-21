@@ -87,6 +87,12 @@ func TestReviewProviderArtifactV2SchemasAreStrictAndBound(t *testing.T) {
 			t.Fatalf("START v2 rejects runtime risk reason %q: %v", code, codes)
 		}
 	}
+	startStates := schemaStringArray(t, start["properties"].(map[string]any)["state"].(map[string]any)["enum"])
+	for _, state := range []string{string(reviewtransaction.StateCorrectionRequired), string(reviewtransaction.StateValidating)} {
+		if !slices.Contains(startStates, state) {
+			t.Fatalf("START v2 rejects valid compact state %q: %v", state, startStates)
+		}
+	}
 
 	status := documents["status-v2.schema.json"]
 	transitionArtifact := status["$defs"].(map[string]any)["transition_artifact"].(map[string]any)
@@ -100,6 +106,21 @@ func TestReviewProviderArtifactV2SchemasAreStrictAndBound(t *testing.T) {
 	if properties["schema"].(map[string]any)["const"] != reviewResultArtifactSchema ||
 		properties["admission_decision"].(map[string]any)["const"] != string(reviewtransaction.ArtifactAdmissionCompleted) {
 		t.Fatalf("status v2 artifact identity = %#v", properties)
+	}
+	transitionInput := status["$defs"].(map[string]any)["transition_input"].(map[string]any)
+	inputRules := transitionInput["allOf"].([]any)
+	captureRule := inputRules[1].(map[string]any)
+	captureThen := captureRule["then"].(map[string]any)
+	for _, field := range []string{"artifact_subject", "candidate_diff", "changed_path_manifest"} {
+		if !slices.Contains(schemaStringArray(t, captureThen["required"]), field) {
+			t.Fatalf("status v2 capture input omits required frozen context %q: %#v", field, captureThen)
+		}
+	}
+	inputProperties := transitionInput["properties"].(map[string]any)
+	if inputProperties["artifact_subject"].(map[string]any)["$ref"] != "artifact-subject.schema.json" ||
+		inputProperties["candidate_diff"].(map[string]any)["$ref"] != "start-v2.schema.json#/$defs/frozen_candidate_diff" ||
+		inputProperties["changed_path_manifest"].(map[string]any)["type"] != "array" {
+		t.Fatalf("status v2 capture input frozen context = %#v", inputProperties)
 	}
 }
 

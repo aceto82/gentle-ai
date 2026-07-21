@@ -59,6 +59,14 @@ type compactAdmittedReviewerResult struct {
 	Result    json.RawMessage   `json:"result"`
 }
 
+type compactProviderReviewerResult struct {
+	SubjectHash string             `json:"subject_hash"`
+	Inspection  ArtifactInspection `json:"inspection"`
+	Lens        string             `json:"lens,omitempty"`
+	Findings    []Finding          `json:"findings"`
+	Evidence    []string           `json:"evidence"`
+}
+
 func CompactResultReopenAuthorization(repository string, request CompactResultReopenRequest, quarantined, retained []CompactResultReopenSlot) string {
 	entries := func(slots []CompactResultReopenSlot) string {
 		values := make([]string, len(slots))
@@ -269,12 +277,58 @@ func inspectCompactResultReopenSlot(storeDir string, state CompactState, frozen 
 		return slot, false, nil
 	}
 	expected, err := NewArtifactSubject(state, envelope.Subject.AuthorityRevision, frozen, lens, order, envelope.Subject.CorrectionTargetIdentity)
-	if err != nil || envelope.Subject != expected || envelope.Admission.Validate(expected) != nil ||
-		envelope.Admission.ResultHash != state.LensResults[order].ResultHash {
+	if err != nil || envelope.Subject != expected || envelope.Admission.Validate(expected) != nil {
+		return slot, false, nil
+	}
+	result, admitted := reAdmitCompactReviewerResult(envelope, expected, frozen)
+	if !admitted || result.ResultHash != state.LensResults[order].ResultHash {
 		return slot, false, nil
 	}
 	slot.SubjectHash, slot.AuthorityRevision = expected.SubjectHash, expected.AuthorityRevision
 	return slot, true, nil
+}
+
+func reAdmitCompactReviewerResult(envelope compactAdmittedReviewerResult, expected ArtifactSubject, frozen FrozenCandidateContext) (LensResult, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(envelope.Result))
+	decoder.DisallowUnknownFields()
+	var provider compactProviderReviewerResult
+	if err := decoder.Decode(&provider); err != nil {
+		return LensResult{}, false
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF || provider.Findings == nil || provider.Evidence == nil {
+		return LensResult{}, false
+	}
+	if !compactProviderLensMatches(provider.Lens, expected.Lens) {
+		return LensResult{}, false
+	}
+	canonicalPayload, err := json.Marshal(provider)
+	if err != nil {
+		return LensResult{}, false
+	}
+	canonicalPayload = append(canonicalPayload, '\n')
+	result, admission, err := AdmitArtifact(ArtifactAdmissionRequest{
+		ExpectedSubject: expected, FrozenContext: frozen, EchoedSubjectHash: provider.SubjectHash,
+		Inspection:                provider.Inspection,
+		Result:                    LensResult{Lens: expected.Lens, Findings: provider.Findings, Evidence: provider.Evidence},
+		CandidateCausalFindingIDs: envelope.Admission.CandidateCausalFindingIDs,
+		RawPayload:                canonicalPayload, CanonicalPayload: canonicalPayload,
+	})
+	if err != nil || admission.Decision != ArtifactAdmissionCompleted ||
+		admission.CanonicalSHA256 != envelope.Admission.CanonicalSHA256 || admission.ResultHash != envelope.Admission.ResultHash {
+		return LensResult{}, false
+	}
+	return result, true
+}
+
+func compactProviderLensMatches(provided, expected string) bool {
+	if provided == "" || provided == expected {
+		return true
+	}
+	return map[string]string{
+		"risk": LensRisk, "resilience": LensResilience,
+		"readability": LensReadability, "reliability": LensReliability,
+	}[provided] == expected
 }
 
 func readCompactReviewerArtifact(path string) ([]byte, string, error) {

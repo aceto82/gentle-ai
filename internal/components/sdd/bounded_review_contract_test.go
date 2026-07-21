@@ -77,7 +77,7 @@ func TestRenderedReviewersAreReadOnlyAndSingleResult(t *testing.T) {
 			path := family + "/agents/review-" + lens + ".md"
 			t.Run(family+"/"+lens, func(t *testing.T) {
 				content := renderBoundedReviewAsset(path)
-				for _, want := range []string{"read-only reviewer", "immutable candidate diff once", "## Candidate-Causal Admission", "Return one JSON object and no prose", nativeReviewerResultSchema, "Never emit summary, skill_resolution, or any other unknown field", "evidence contains only genuine inspection evidence"} {
+				for _, want := range []string{"read-only reviewer", "immutable candidate diff once", "## Candidate-Causal Admission", "Return one JSON object and no prose", `"subject_hash":"<artifact_subject.subject_hash>"`, `"inspection":{"status":"completed","paths":["<every changed_path_manifest.path in exact order>"]}`, "Never emit summary, skill_resolution, or any other unknown field", "evidence contains only genuine inspection evidence"} {
 					if !strings.Contains(content, want) {
 						t.Errorf("%s missing %q", path, want)
 					}

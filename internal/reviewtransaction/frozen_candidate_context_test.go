@@ -191,9 +191,7 @@ func TestFrozenCandidateContextIsolatesAllGitAttributesConfigAndLocale(t *testin
 		t.Fatal(err)
 	}
 	globalConfig := filepath.Join(t.TempDir(), "gitconfig")
-	if err := os.WriteFile(globalConfig, []byte("[core]\n\tattributesFile = "+globalAttributes+"\n[diff]\n\texternal = false\n\talgorithm = minimal\n\tcontext = 0\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeFrozenCandidateHostileGitConfig(t, globalConfig, globalAttributes)
 	t.Setenv("GIT_CONFIG_GLOBAL", globalConfig)
 	t.Setenv("GIT_DIFF_OPTS", "--unified=0")
 	t.Setenv("LC_ALL", "hostile_INVALID.UTF-8")
@@ -226,6 +224,36 @@ func TestFrozenCandidateContextIsolatesAllGitAttributesConfigAndLocale(t *testin
 	}
 	if !reflect.DeepEqual(replayedStats, baselineStats) {
 		t.Fatalf("frozen diff stats changed under mutable attributes/config/locale\nfirst=%#v\nreplayed=%#v", baselineStats, replayedStats)
+	}
+}
+
+func TestFrozenCandidateHostileGitConfigEscapesWindowsPath(t *testing.T) {
+	requireSnapshotGit(t)
+	config := filepath.Join(t.TempDir(), "gitconfig")
+	windowsPath := `C:\Users\reviewer\global attributes`
+	writeFrozenCandidateHostileGitConfig(t, config, windowsPath)
+	command := exec.Command("git", "config", "--file", config, "--get", "core.attributesFile")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("portable Git config rejected Windows path: %v\n%s", err, output)
+	}
+	if got := strings.TrimSpace(string(output)); got != windowsPath {
+		t.Fatalf("portable Git config path = %q, want %q", got, windowsPath)
+	}
+}
+
+func writeFrozenCandidateHostileGitConfig(t *testing.T, path, attributesFile string) {
+	t.Helper()
+	for _, entry := range [][2]string{
+		{"core.attributesFile", attributesFile},
+		{"diff.external", "false"},
+		{"diff.algorithm", "minimal"},
+		{"diff.context", "0"},
+	} {
+		command := exec.Command("git", "config", "--file", path, entry[0], entry[1])
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("write portable Git config %s: %v\n%s", entry[0], err, output)
+		}
 	}
 }
 

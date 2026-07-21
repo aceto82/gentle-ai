@@ -27,14 +27,16 @@ const (
 // reviewing authority reachable from the resolved repository root, before a
 // bound reviewer consumes its exactly-once invocation.
 type reviewCapturePreflightResult struct {
-	Schema          string                            `json:"schema"`
-	Capability      string                            `json:"capability"`
-	RepositoryRoot  string                            `json:"repository_root,omitempty"`
-	LineageID       string                            `json:"lineage_id"`
-	TargetIdentity  string                            `json:"target_identity"`
-	Lens            string                            `json:"lens"`
-	SelectedOrder   int                               `json:"selected_order"`
-	ArtifactSubject reviewtransaction.ArtifactSubject `json:"artifact_subject"`
+	Schema              string                                       `json:"schema"`
+	Capability          string                                       `json:"capability"`
+	RepositoryRoot      string                                       `json:"repository_root,omitempty"`
+	LineageID           string                                       `json:"lineage_id"`
+	TargetIdentity      string                                       `json:"target_identity"`
+	Lens                string                                       `json:"lens"`
+	SelectedOrder       int                                          `json:"selected_order"`
+	ArtifactSubject     reviewtransaction.ArtifactSubject            `json:"artifact_subject"`
+	CandidateDiff       reviewtransaction.FrozenCandidateDiff        `json:"candidate_diff"`
+	ChangedPathManifest []reviewtransaction.ChangedPathManifestEntry `json:"changed_path_manifest"`
 }
 
 // reviewIncidentArtifact references one durably preserved raw reviewer result.

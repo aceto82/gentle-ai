@@ -82,6 +82,11 @@ func (admission ArtifactAdmission) Validate(subject ArtifactSubject) error {
 	if err != nil || !equalStrings(ids, admission.CandidateCausalFindingIDs) {
 		return errors.New("artifact admission candidate-causal finding IDs are not canonical")
 	}
+	for _, id := range ids {
+		if !artifactFindingID.MatchString(id) {
+			return errors.New("artifact admission candidate-causal finding ID is invalid")
+		}
+	}
 	return ValidateArtifactSubject(subject)
 }
 
@@ -153,6 +158,9 @@ func AdmitArtifact(request ArtifactAdmissionRequest) (LensResult, ArtifactAdmiss
 		}
 	}
 	for _, finding := range canonical.Findings {
+		if !artifactFindingID.MatchString(finding.ID) {
+			return fail(ArtifactAdmissionBindingMismatch, "reviewer finding ID does not match the native ASCII schema")
+		}
 		if !strings.HasPrefix(finding.ID, wantPrefix) {
 			return fail(ArtifactAdmissionBindingMismatch, "reviewer finding ID is not bound to the selected lens")
 		}
@@ -252,7 +260,8 @@ func ExtractBoundedSingleJSONObject(payload []byte, limit int) ([]byte, Artifact
 	return append([]byte(nil), bytes.TrimSpace(payload[match.start:match.end])...), ArtifactAdmissionCompleted, nil
 }
 
-var artifactLocationReference = regexp.MustCompile(`(?:^|[[:space:]('"\[])([A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)+):[1-9][0-9]*`)
+var artifactFindingID = regexp.MustCompile(`^R[1-4]-[A-Za-z0-9][A-Za-z0-9._-]*$`)
+var artifactLocationReference = regexp.MustCompile(`(?:^|[[:space:]('"\[])([A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*):[1-9][0-9]*`)
 
 func referenceOutsideScope(value string, allowed map[string]struct{}) bool {
 	for _, match := range artifactLocationReference.FindAllStringSubmatch(value, -1) {

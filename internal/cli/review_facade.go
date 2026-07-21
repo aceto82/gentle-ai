@@ -455,6 +455,7 @@ func runReviewStatus(ctx context.Context, args []string, stdout io.Writer) error
 			artifacts := []ReviewTransitionArtifact{}
 			evidenceAvailable := false
 			repositoryContext := ""
+			var captureContext *reviewCaptureContext
 			var validationRequest *reviewtransaction.TargetedValidationRequest
 			correctionForecasted := false
 			var artifactErr error
@@ -479,6 +480,14 @@ func runReviewStatus(ctx context.Context, args []string, stdout io.Writer) error
 							repositoryContext, artifactErr = reviewtransaction.PublishReviewRepositoryContext(ctx, root, reviewtransaction.ReviewRepositoryContextBinding{
 								LineageID: record.State.LineageID, TargetIdentity: record.State.InitialSnapshot.Identity, Revision: record.Revision,
 							})
+							if artifactErr == nil {
+								frozen, frozenErr := (reviewtransaction.SnapshotBuilder{Repo: root}).FrozenCandidateContext(ctx, record.State.InitialSnapshot)
+								if frozenErr != nil {
+									artifactErr = frozenErr
+								} else {
+									captureContext, artifactErr = newReviewCaptureContext(record.State, record.Revision, frozen)
+								}
+							}
 						}
 						if artifactErr == nil {
 							artifacts, artifactErr = discoverCapturedReviewerArtifacts(ctx, root, store.Dir, record.State, record.Revision)
@@ -490,7 +499,7 @@ func runReviewStatus(ctx context.Context, args []string, stdout io.Writer) error
 					}
 				}
 			}
-			transition := newReviewNextTransition(result, native.SelectedLenses, artifacts, evidenceAvailable, artifactErr, reviewNextTransitionInput{Gate: reviewtransaction.GateKind(*gate), Successor: *recoverySuccessor, Reason: *recoveryReason, Actor: *recoveryActor, Authorization: *recoveryAuthorization, RepositoryContext: repositoryContext, ValidationRequest: validationRequest, CorrectionForecasted: correctionForecasted})
+			transition := newReviewNextTransition(result, native.SelectedLenses, artifacts, evidenceAvailable, artifactErr, reviewNextTransitionInput{Gate: reviewtransaction.GateKind(*gate), Successor: *recoverySuccessor, Reason: *recoveryReason, Actor: *recoveryActor, Authorization: *recoveryAuthorization, RepositoryContext: repositoryContext, ValidationRequest: validationRequest, CorrectionForecasted: correctionForecasted, CaptureContext: captureContext})
 			result.NextTransition = &transition
 		}
 		if err := result.Validate(); err != nil {
@@ -2248,6 +2257,7 @@ type reviewFinalizeOutputContext struct {
 
 func encodeCompactFacadeFinalize(stdout io.Writer, negotiated, actionEligibility, nextTransition bool, state reviewtransaction.CompactState, revision string, store reviewtransaction.CompactStore, action string, contexts ...reviewFinalizeOutputContext) error {
 	var validationRequest *reviewtransaction.TargetedValidationRequest
+	var captureContext *reviewCaptureContext
 	repositoryContext := ""
 	var transitionErr error
 	if negotiated && len(contexts) > 0 && contexts[0].Context != nil && strings.TrimSpace(contexts[0].Repo) != "" {
@@ -2262,6 +2272,14 @@ func encodeCompactFacadeFinalize(stdout io.Writer, negotiated, actionEligibility
 			repositoryContext, transitionErr = reviewtransaction.PublishReviewRepositoryContext(outputContext.Context, outputContext.Repo, reviewtransaction.ReviewRepositoryContextBinding{
 				LineageID: state.LineageID, TargetIdentity: state.InitialSnapshot.Identity, Revision: revision,
 			})
+			if transitionErr == nil {
+				frozen, err := (reviewtransaction.SnapshotBuilder{Repo: outputContext.Repo}).FrozenCandidateContext(outputContext.Context, state.InitialSnapshot)
+				if err != nil {
+					transitionErr = err
+				} else {
+					captureContext, transitionErr = newReviewCaptureContext(state, revision, frozen)
+				}
+			}
 		}
 	}
 	var eligibility *ReviewActionEligibility
@@ -2283,7 +2301,7 @@ func encodeCompactFacadeFinalize(stdout io.Writer, negotiated, actionEligibility
 			artifactErr = transitionErr
 		}
 		value := reviewFinalizeNextTransition(state, revision, artifacts, artifactErr, reviewFinalizeTransitionContext{
-			RepositoryContext: repositoryContext, ValidationRequest: validationRequest,
+			RepositoryContext: repositoryContext, ValidationRequest: validationRequest, CaptureContext: captureContext,
 		})
 		transition = &value
 	}

@@ -39,6 +39,9 @@ type strictLedgerEnvelope struct {
 }
 
 func ledgerProjection(findings []Finding) []ledgerFinding {
+	if findings == nil {
+		return nil
+	}
 	projected := make([]ledgerFinding, len(findings))
 	for index, finding := range findings {
 		projected[index] = ledgerFinding{

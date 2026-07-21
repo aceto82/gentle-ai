@@ -276,7 +276,8 @@ func RunReviewCaptureResult(args []string, stdout io.Writer) error {
 		return encodeReviewJSON(stdout, reviewCapturePreflightResult{
 			Schema: reviewCapturePreflightSchema, Capability: reviewCapturePreflightCapability, RepositoryRoot: publicRoot,
 			LineageID: state.LineageID, TargetIdentity: state.InitialSnapshot.Identity, Lens: *lens, SelectedOrder: *order,
-			ArtifactSubject: subject,
+			ArtifactSubject: subject, CandidateDiff: frozen.CandidateDiff,
+			ChangedPathManifest: append([]reviewtransaction.ChangedPathManifestEntry{}, frozen.ChangedPathManifest...),
 		})
 	}
 	rawPayload, err := readFacadeBytes(*input)

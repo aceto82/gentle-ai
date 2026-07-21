@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -55,6 +56,14 @@ func TestReviewCaptureResultPreflightVerifiesBindingWithoutMutation(t *testing.T
 	}
 	if err := reviewtransaction.ValidateArtifactSubject(preflight.ArtifactSubject); err != nil {
 		t.Fatalf("preflight artifact subject = %#v: %v", preflight.ArtifactSubject, err)
+	}
+	wantContext, err := (reviewtransaction.SnapshotBuilder{Repo: repo}).FrozenCandidateContext(context.Background(), record.State.InitialSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(preflight.CandidateDiff, wantContext.CandidateDiff) ||
+		!reflect.DeepEqual(preflight.ChangedPathManifest, wantContext.ChangedPathManifest) {
+		t.Fatalf("preflight frozen context differs from authority\ngot=%#v %#v\nwant=%#v %#v", preflight.CandidateDiff, preflight.ChangedPathManifest, wantContext.CandidateDiff, wantContext.ChangedPathManifest)
 	}
 	if _, err := os.Stat(filepath.Join(store.Dir, reviewtransaction.CompactReviewerResultsDir)); !os.IsNotExist(err) {
 		t.Fatal("preflight persisted a reviewer result artifact")

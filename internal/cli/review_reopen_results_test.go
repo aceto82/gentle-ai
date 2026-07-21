@@ -268,6 +268,51 @@ func TestReviewReopenResultsRetainsAdmittedSlotsAndRejectsCleanAuthority(t *test
 	}
 }
 
+func TestReviewReopenResultsQuarantinesTamperedAdmittedResultBytes(t *testing.T) {
+	repo, started, store, initial, artifact := capturedArtifact(t)
+	if err := RunReviewFacadeFinalize([]string{
+		"--cwd", repo, "--lineage", started.LineageID, "--result-artifact", mustReviewJSON(t, artifact),
+	}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	validating, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(store.Dir, reviewtransaction.CompactReviewerResultsDir, fmt.Sprintf("%02d-%s.json", 0, initial.State.SelectedLenses[0]))
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope admittedReviewerResult
+	decodeStrictReviewJSON(t, payload, &envelope)
+	envelope.Result.Evidence = []string{"tampered after provider admission"}
+	payload, err = json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload = append(payload, '\n')
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tamperedDigest := facadePayloadHash(payload)
+	if err := os.WriteFile(path+".sha256", []byte(tamperedDigest+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request := reviewtransaction.CompactResultReopenRequest{
+		LineageID: started.LineageID, ExpectedRevision: validating.Revision,
+		TargetIdentity: validating.State.InitialSnapshot.Identity,
+		Reason:         "replace tampered provider result", Actor: "maintainer@example.com",
+	}
+	plan, err := reviewtransaction.PrepareCompactResultReopen(context.Background(), repo, request)
+	if err != nil {
+		t.Fatalf("tampered admitted result should be quarantinable: %v", err)
+	}
+	if len(plan.Retained) != 0 || len(plan.Quarantined) != 1 || plan.Quarantined[0].ArtifactDigest != tamperedDigest {
+		t.Fatalf("tampered result plan = %#v", plan)
+	}
+}
+
 func mustReviewJSON(t *testing.T, value any) string {
 	t.Helper()
 	payload, err := json.Marshal(value)

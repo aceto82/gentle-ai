@@ -66,6 +66,8 @@
         "fix_required",
         "fixing",
         "fix_validating",
+        "correction_required",
+        "validating",
         "ready_final_verification",
         "final_verifying",
         "approved",

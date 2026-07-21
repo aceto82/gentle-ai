@@ -1561,7 +1561,7 @@ func (transaction *Transaction) validateFindingRouting() error {
 }
 
 func findingsHash(findings []Finding) string {
-	payload, _ := json.Marshal(findings)
+	payload, _ := json.Marshal(ledgerProjection(findings))
 	sum := sha256.Sum256(append([]byte("gentle-ai.review-ledger-findings/v1\x00"), payload...))
 	return "sha256:" + hex.EncodeToString(sum[:])
 }

@@ -2,6 +2,7 @@ package reviewtransaction
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,6 +10,135 @@ import (
 	"sync"
 	"testing"
 )
+
+func TestResolveReviewRepositoryReturnsOnlyLiveMatchingCandidate(t *testing.T) {
+	repo, locator := reviewRepositoryLocatorFixture(t, "locator-resolve")
+	if err := PublishReviewRepositoryLocators(context.Background(), repo, []ReviewRepositoryLocator{locator}); err != nil {
+		t.Fatal(err)
+	}
+	root, err := ResolveReviewRepository(context.Background(), locator)
+	if err != nil || root != repo {
+		t.Fatalf("resolution = %q, %v; want %q", root, err, repo)
+	}
+	for _, wrong := range []ReviewRepositoryLocator{
+		{Lineage: locator.Lineage, Target: "sha256:" + strings.Repeat("b", 64), Lens: locator.Lens, Order: locator.Order},
+		{Lineage: locator.Lineage, Target: locator.Target, Lens: LensRisk, Order: locator.Order},
+		{Lineage: locator.Lineage, Target: locator.Target, Lens: locator.Lens, Order: locator.Order + 1},
+	} {
+		if _, err := ResolveReviewRepository(context.Background(), wrong); err == nil {
+			t.Fatalf("wrong binding resolved: %#v", wrong)
+		}
+	}
+}
+
+func TestResolveReviewRepositoryRejectsIdentityAndBucketTampering(t *testing.T) {
+	repo, locator := reviewRepositoryLocatorFixture(t, "locator-resolve-unsafe")
+	if err := PublishReviewRepositoryLocators(context.Background(), repo, []ReviewRepositoryLocator{locator}); err != nil {
+		t.Fatal(err)
+	}
+	path := reviewRepositoryLocatorTestPath(t, locator, repo)
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var candidate reviewRepositoryLocatorFile
+	if err := json.Unmarshal(payload, &candidate); err != nil {
+		t.Fatal(err)
+	}
+	candidate.GitCommonDir = filepath.Join(repo, "missing-common")
+	payload, err = json.Marshal(candidate)
+	if err != nil || os.WriteFile(path, append(payload, '\n'), 0o600) != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveReviewRepository(context.Background(), locator); err == nil {
+		t.Fatal("tampered identity resolved")
+	}
+	if runtime.GOOS == "windows" {
+		return
+	}
+	bucket := filepath.Dir(path)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(bucket); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(repo, bucket); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveReviewRepository(context.Background(), locator); err == nil {
+		t.Fatal("symlinked bucket resolved")
+	}
+}
+
+func TestResolveReviewRepositoryFailsClosedForZeroMultipleAndTamperedCandidates(t *testing.T) {
+	repo, locator := reviewRepositoryLocatorFixture(t, "locator-resolve-closed")
+	if _, err := ResolveReviewRepository(context.Background(), locator); err == nil {
+		t.Fatal("zero candidates resolved")
+	}
+	if err := PublishReviewRepositoryLocators(context.Background(), repo, []ReviewRepositoryLocator{locator}); err != nil {
+		t.Fatal(err)
+	}
+	_, common, err := reviewRepositoryIdentity(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := repo + string(filepath.Separator) + "."
+	path, err := reviewRepositoryLocatorPath(locator, alias, common)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(reviewRepositoryLocatorFile{reviewRepositoryLocatorSchema, locator.Lineage, locator.Target, locator.Lens, locator.Order, alias, common})
+	if err != nil || os.WriteFile(path, append(payload, '\n'), 0o600) != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveReviewRepository(context.Background(), locator); err == nil {
+		t.Fatal("multiple candidates resolved")
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(reviewRepositoryLocatorTestPath(t, locator, repo), []byte(`{"schema":"bad"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveReviewRepository(context.Background(), locator); err == nil {
+		t.Fatal("tampered candidate resolved")
+	}
+}
+
+func TestResolveReviewRepositoryRejectsMissingOrTerminalAuthority(t *testing.T) {
+	repo, locator := reviewRepositoryLocatorFixture(t, "locator-resolve-state")
+	if err := PublishReviewRepositoryLocators(context.Background(), repo, []ReviewRepositoryLocator{locator}); err != nil {
+		t.Fatal(err)
+	}
+	store, err := CompactAuthoritativeStore(context.Background(), repo, locator.Lineage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(store.StatePath()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveReviewRepository(context.Background(), locator); err == nil {
+		t.Fatal("missing authority resolved")
+	}
+	if _, err := store.Replace("", "review/start", record.State); err != nil {
+		t.Fatal(err)
+	}
+	terminal := record.State
+	if err := terminal.Invalidate("obsolete"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Replace(record.Revision, "review/invalidate", terminal); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveReviewRepository(context.Background(), locator); err == nil {
+		t.Fatal("terminal authority resolved")
+	}
+}
 
 func TestReviewRepositoryLocatorPublishesPrivateImmutableRecord(t *testing.T) {
 	repo, locator := reviewRepositoryLocatorFixture(t, "locator-private")

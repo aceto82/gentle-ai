@@ -67,6 +67,90 @@ func PublishReviewRepositoryLocators(ctx context.Context, repo string, locators 
 	return nil
 }
 
+// ResolveReviewRepository returns the sole repository whose untrusted locator
+// and live compact authority both match the exact four-field binding.
+func ResolveReviewRepository(ctx context.Context, locator ReviewRepositoryLocator) (string, error) {
+	if err := validateReviewRepositoryLocator(locator); err != nil {
+		return "", err
+	}
+	dir, err := reviewRepositoryLocatorBucket(locator)
+	if err != nil {
+		return "", err
+	}
+	entries, err := readReviewRepositoryLocatorBucket(dir)
+	if err != nil {
+		return "", err
+	}
+	valid := make([]string, 0, 1)
+	for _, entry := range entries {
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || filepath.Ext(entry.Name()) != ".json" {
+			return "", errors.New("review repository locator bucket is unsafe")
+		}
+		root, err := resolveReviewRepositoryCandidate(ctx, filepath.Join(dir, entry.Name()), locator)
+		if err != nil {
+			return "", err
+		}
+		valid = append(valid, root)
+	}
+	if len(valid) != 1 {
+		return "", errors.New("review repository locator resolution requires exactly one candidate")
+	}
+	return valid[0], nil
+}
+
+func resolveReviewRepositoryCandidate(ctx context.Context, path string, want ReviewRepositoryLocator) (string, error) {
+	payload, err := readReviewRepositoryLocator(path)
+	if err != nil {
+		return "", err
+	}
+	var candidate reviewRepositoryLocatorFile
+	if err := decodeReviewRepositoryLocator(payload, &candidate); err != nil ||
+		candidate.Lineage != want.Lineage || candidate.Target != want.Target || candidate.Lens != want.Lens || candidate.Order != want.Order ||
+		filepath.Base(path) != identityHash(candidate.RepositoryRoot+"\x00"+candidate.GitCommonDir)+".json" {
+		return "", errors.New("review repository locator binding is invalid")
+	}
+	root, commonDir, err := reviewRepositoryIdentity(ctx, candidate.RepositoryRoot)
+	if err != nil || !sameLocatorDirectory(root, candidate.RepositoryRoot) || !sameLocatorDirectory(commonDir, candidate.GitCommonDir) {
+		return "", errors.New("review repository locator identity changed")
+	}
+	store, err := CompactAuthoritativeStore(ctx, root, want.Lineage)
+	if err != nil {
+		return "", err
+	}
+	record, err := store.Load()
+	if err != nil || record.State.State != StateReviewing || record.State.LineageID != want.Lineage ||
+		record.State.InitialSnapshot.Identity != want.Target || want.Order >= len(record.State.SelectedLenses) ||
+		record.State.SelectedLenses[want.Order] != want.Lens || len(record.State.LensResults) != want.Order {
+		return "", errors.New("review repository locator has no live matching authority")
+	}
+	return root, nil
+}
+
+func reviewRepositoryLocatorBucket(locator ReviewRepositoryLocator) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".gentle-ai", "review-locators", "v1", locatorHash(locator)), nil
+}
+
+func readReviewRepositoryLocatorBucket(path string) ([]fs.DirEntry, error) {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return nil, errors.New("review repository locator bucket is unsafe")
+	}
+	dir, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+	opened, err := dir.Stat()
+	if err != nil || !opened.IsDir() || !os.SameFile(info, opened) {
+		return nil, errors.New("review repository locator bucket changed while opening")
+	}
+	return dir.ReadDir(-1)
+}
+
 func publishReviewRepositoryLocator(path string, payload []byte) error {
 	existing, err := readReviewRepositoryLocator(path)
 	if err == nil {
@@ -167,11 +251,11 @@ func reviewRepositoryIdentity(ctx context.Context, repo string) (string, string,
 }
 
 func reviewRepositoryLocatorPath(locator ReviewRepositoryLocator, root, commonDir string) (string, error) {
-	home, err := os.UserHomeDir()
+	dir, err := reviewRepositoryLocatorBucket(locator)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".gentle-ai", "review-locators", "v1", locatorHash(locator), identityHash(root+"\x00"+commonDir)+".json"), nil
+	return filepath.Join(dir, identityHash(root+"\x00"+commonDir)+".json"), nil
 }
 
 func locatorHash(locator ReviewRepositoryLocator) string {

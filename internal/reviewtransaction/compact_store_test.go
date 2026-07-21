@@ -706,6 +706,91 @@ func TestStartCompactAuthorityCreatesWithUnrelatedHistoricalLeaves(t *testing.T)
 	}
 }
 
+func TestStartCompactAuthorityRequiresRecoveryForApprovedSameScopeChangedCandidate(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	paths := []string{"first.txt", "second.txt", "third.txt", "fourth.txt"}
+	for _, path := range paths {
+		writeSnapshotFile(t, repo, path, "base "+path+"\n")
+	}
+	gitSnapshot(t, repo, "add", "--", "first.txt", "second.txt", "third.txt", "fourth.txt")
+	gitSnapshot(t, repo, "commit", "-m", "add review scope")
+	for _, path := range paths {
+		writeSnapshotFile(t, repo, path, "reviewed "+path+"\n")
+	}
+	approved, store, receipt := approvedCompactCurrentChangesFixture(t, repo, "compact-start-approved-scope", []string{})
+	predecessor, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSnapshotFile(t, repo, "first.txt", "changed first.txt\n")
+	writeSnapshotFile(t, repo, "second.txt", "changed second.txt\n")
+
+	requested := newCompactTestState(t, repo, "compact-start-approved-scope-g2")
+	if approved.InitialSnapshot.Projection != requested.InitialSnapshot.Projection ||
+		approved.InitialSnapshot.BaseTree != requested.InitialSnapshot.BaseTree ||
+		approved.InitialSnapshot.PathsDigest != requested.InitialSnapshot.PathsDigest ||
+		!equalStrings(approved.GenesisPaths, requested.InitialSnapshot.Paths) ||
+		approved.CurrentSnapshot.CandidateTree == requested.InitialSnapshot.CandidateTree {
+		t.Fatalf("regression fixture does not retain delivery scope with a changed candidate: approved=%#v requested=%#v", approved.InitialSnapshot, requested.InitialSnapshot)
+	}
+	gate := EvaluateCompactGate(context.Background(), repo, receipt, NativeGateRequestInput{Gate: GatePostApply, LineageID: approved.LineageID})
+	if gate.Result != GateScopeChanged || gate.Context.Denial == nil || gate.Context.Denial.Code != "candidate-or-paths-mismatch" ||
+		gate.Context.ScopeChange == nil || gate.Context.ScopeChange.RecoveryOperation != "review.recover" ||
+		gate.Context.ScopeChange.PredecessorRevision != predecessor.Revision || gate.Context.ScopeChange.DifferingPathCount != 2 {
+		t.Fatalf("same-scope changed-candidate gate = %#v", gate)
+	}
+
+	type outcome struct {
+		result CompactStartResult
+		err    error
+	}
+	results := make(chan outcome, 2)
+	for _, lineage := range []string{"compact-start-approved-scope-race-a", "compact-start-approved-scope-race-b"} {
+		state := requested
+		state.LineageID = lineage
+		go func() {
+			result, startErr := StartCompactAuthority(context.Background(), repo, CompactStartRequest{State: state})
+			results <- outcome{result: result, err: startErr}
+		}()
+	}
+	for range 2 {
+		got := <-results
+		if got.err != nil || got.result.Action != CompactStartRecover || got.result.Record.Revision != predecessor.Revision {
+			t.Fatalf("concurrent same-scope START = %#v, %v", got.result, got.err)
+		}
+	}
+	explicit := requested
+	explicit.LineageID = "compact-start-approved-scope-explicit"
+	got, err := StartCompactAuthority(context.Background(), repo, CompactStartRequest{State: explicit, ExplicitLineage: true})
+	if err != nil || got.Action != CompactStartRecover || got.Record.Revision != predecessor.Revision {
+		t.Fatalf("explicit successor START = %#v, %v", got, err)
+	}
+	explicit.LineageID = approved.LineageID
+	got, err = StartCompactAuthority(context.Background(), repo, CompactStartRequest{State: explicit, ExplicitLineage: true})
+	if err != nil || got.Action != CompactStartBlocked || got.Record.Revision != predecessor.Revision {
+		t.Fatalf("explicit predecessor START = %#v, %v", got, err)
+	}
+
+	requested.Generation = approved.Generation + 1
+	reason, actor := "candidate changed after approval", "maintainer@example.com"
+	recovered, err := RecoverCompactAuthority(context.Background(), repo, CompactRecoveryRequest{
+		PredecessorLineageID: approved.LineageID, ExpectedPredecessorRevision: predecessor.Revision,
+		Successor: requested, Disposition: RecoveryScopeChanged, Reason: reason, Actor: actor,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance := recovered.State.Recovery
+	if provenance == nil || provenance.PredecessorLineageID != approved.LineageID ||
+		provenance.PredecessorRevision != predecessor.Revision || provenance.Reason != reason || provenance.Actor != actor {
+		t.Fatalf("recovery provenance = %#v", provenance)
+	}
+	if len(recovered.State.LensResults) != 0 || len(recovered.State.Findings) != 0 || recovered.State.EvidenceHash != "" ||
+		len(recovered.State.CorrectionAttempts) != 0 {
+		t.Fatalf("recovery reused predecessor evidence: %#v", recovered.State)
+	}
+}
+
 func TestStartCompactAuthorityResumesMatchingAuthorityAmongUnrelatedLeaves(t *testing.T) {
 	repo := initSnapshotRepo(t)
 	writeSnapshotFile(t, repo, "tracked.txt", "unrelated one\n")

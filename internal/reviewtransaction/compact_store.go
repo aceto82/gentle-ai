@@ -676,6 +676,11 @@ func StartCompactAuthority(ctx context.Context, repo string, request CompactStar
 			}
 			continue
 		}
+		if existing.State == StateApproved && compactStartDeliveryScopeMatches(existing, request.State) &&
+			existing.CurrentSnapshot.CandidateTree != request.State.InitialSnapshot.CandidateTree {
+			recoveryCandidates = append(recoveryCandidates, store)
+			continue
+		}
 		if compactStartClaimsTarget(ctx, requestedStore.repo, existing, request.State) {
 			claimants = append(claimants, store)
 			requestedClaims = requestedClaims || store.lineageID == request.State.LineageID

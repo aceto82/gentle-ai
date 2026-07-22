@@ -1106,7 +1106,7 @@ func runReviewFacadeFinalize(ctx context.Context, args []string, stdout io.Write
 	if err != nil {
 		return fmt.Errorf("resolve review repository root: %w", err)
 	}
-	store, record, err := discoverCompactFacadeReview(ctx, root, *lineage, false)
+	store, record, err := discoverCompactFacadeFinalize(ctx, root, *lineage)
 	if err != nil {
 		if _, chain, _, legacyErr := discoverFacadeReview(ctx, root, *lineage, false); legacyErr == nil {
 			legacyLineage := chain.Records[len(chain.Records)-1].Transaction.LineageID
@@ -1239,12 +1239,13 @@ func runReviewFacadeFinalize(ctx context.Context, args []string, stdout io.Write
 	}
 	var attempt reviewtransaction.FinalizeAttempt
 	attemptLoaded := false
+	var pendingAtEntry *reviewtransaction.FinalizeAttempt
 	if !terminalAtEntry {
-		pending, pendingErr := store.PendingFinalizeAttempt()
-		if pendingErr != nil {
-			return pendingErr
+		pendingAtEntry, err = store.PendingFinalizeAttempt()
+		if err != nil {
+			return err
 		}
-		if index := facadeFinalizeTransitionIndex(pending, record.Revision); index >= 0 {
+		if index := facadeFinalizeTransitionIndex(pendingAtEntry, record.Revision); index >= 0 {
 			replayEvidence := evidence
 			if len(replayEvidence) == 0 && facadeNativeLowRiskCandidate(state) {
 				replayEvidence, err = prepareFacadeNativeLowRiskVerification(ctx, root, state)
@@ -1265,11 +1266,33 @@ func runReviewFacadeFinalize(ctx context.Context, args []string, stdout io.Write
 			}
 		}
 	}
+	if !terminalAtEntry && pendingAtEntry == nil {
+		if err := (reviewtransaction.SnapshotBuilder{Repo: root}).ValidateEvidence(ctx, state.CurrentSnapshot); err != nil {
+			// Keep negotiated Git failures classified as preflight/not_started.
+			return reviewPreflightError(fmt.Errorf("validate FINALIZE current snapshot: %v", err))
+		}
+	}
 	plan, err := prepareFacadeFinalizePlan(ctx, root, record.Revision, state, reviewerResults, refuter, validation, evidence, *correctionLines, *failed)
 	if err != nil {
 		return reviewPreflightError(err)
 	}
+	// A zero-transition next-transition request is a read-only routing projection;
+	// correction routing may intentionally describe a live target not frozen yet.
+	if !terminalAtEntry && pendingAtEntry == nil && (len(plan.Transitions) > 0 || !*nextTransition) {
+		if err := (reviewtransaction.SnapshotBuilder{Repo: root}).ValidateLiveSnapshot(ctx, plan.Candidate); err != nil {
+			return reviewPreflightError(fmt.Errorf("validate FINALIZE live target: %v", err))
+		}
+	}
+	if !terminalAtEntry && pendingAtEntry == nil && len(plan.Transitions) == 0 {
+		return encodeCompactFacadeFinalize(stdout, negotiated, *actionEligibility, *nextTransition, state, record.Revision, store, "continue the current review state", reviewFinalizeOutputContext{Context: ctx, Repo: root})
+	}
 	request := facadeFinalizeAttemptRequestForCandidate(record, plan.Candidate, reviewerResults, validation, refuter, plan.Evidence, *correctionLines, *failed)
+	if !terminalAtEntry && pendingAtEntry != nil && !attemptLoaded {
+		attempt, attemptLoaded, err = store.ReconcileFinalizeAttempt(ctx, request)
+		if err != nil {
+			return err
+		}
+	}
 	if terminalAtEntry {
 		if terminalPending != nil {
 			attempt = *terminalPending
@@ -2099,6 +2122,59 @@ func nativeFacadeReviewerLens(lens string) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported reviewer lens %q", lens)
 	}
+}
+
+func discoverCompactFacadeFinalize(ctx context.Context, repo, lineage string) (reviewtransaction.CompactStore, reviewtransaction.CompactRecord, error) {
+	if strings.TrimSpace(lineage) != "" {
+		return discoverCompactFacadeReview(ctx, repo, lineage, false)
+	}
+	stores, err := reviewtransaction.CompactAuthorityLeaves(ctx, repo)
+	if err != nil {
+		return reviewtransaction.CompactStore{}, reviewtransaction.CompactRecord{}, err
+	}
+	type candidate struct {
+		store  reviewtransaction.CompactStore
+		record reviewtransaction.CompactRecord
+	}
+	candidates := []candidate{}
+	for _, store := range stores {
+		if record, loadErr := store.Load(); loadErr == nil {
+			candidates = append(candidates, candidate{store: store, record: record})
+		}
+	}
+	if len(candidates) > 1 {
+		active := candidates[:0]
+		for _, candidate := range candidates {
+			if !facadeTerminalState(candidate.record.State.State) {
+				active = append(active, candidate)
+			}
+		}
+		if len(active) > 0 {
+			candidates = active
+		}
+	}
+	if len(candidates) > 1 && facadeTerminalState(candidates[0].record.State.State) {
+		return discoverCompactFacadeReview(ctx, repo, "", false)
+	}
+	if len(candidates) > 1 {
+		exact := candidates[:0]
+		for _, candidate := range candidates {
+			if (reviewtransaction.SnapshotBuilder{Repo: repo}).ValidateLiveSnapshot(ctx, candidate.record.State.CurrentSnapshot) == nil {
+				exact = append(exact, candidate)
+			}
+		}
+		if len(exact) == 0 {
+			return reviewtransaction.CompactStore{}, reviewtransaction.CompactRecord{}, reviewPreflightError(errors.New("no compact FINALIZE authority matches the live target"))
+		}
+		candidates = exact
+	}
+	if len(candidates) == 0 {
+		return reviewtransaction.CompactStore{}, reviewtransaction.CompactRecord{}, errors.New("no discoverable compact facade review lineage found")
+	}
+	if len(candidates) != 1 {
+		return reviewtransaction.CompactStore{}, reviewtransaction.CompactRecord{}, errors.New("multiple compact facade review lineages found; specify --lineage")
+	}
+	return candidates[0].store, candidates[0].record, nil
 }
 
 func discoverCompactFacadeReview(ctx context.Context, repo, lineage string, terminal bool) (reviewtransaction.CompactStore, reviewtransaction.CompactRecord, error) {

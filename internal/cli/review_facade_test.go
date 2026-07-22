@@ -617,6 +617,7 @@ func TestReviewFacadeFinalizeReceiptPublicationFailureIsExactlyReplayable(t *tes
 		return reviewtransaction.WriteCompactReceiptAtomic(path, got)
 	}
 	defer func() { writeCompactFacadeReceipt = original }()
+	writeReviewStartCandidate(t, fixture.repo, "tracked.txt", "later worktree drift\n", 0o644)
 	var output bytes.Buffer
 	if err := RunReviewFacadeFinalize([]string{"--cwd", fixture.repo, "--lineage", fixture.started.LineageID}, &output); err != nil {
 		t.Fatalf("exact receipt replay: %v", err)
@@ -734,6 +735,7 @@ func TestReviewFacadeFinalizePlannedTransitionInterruptionResumesWithoutDuplicat
 		t.Fatalf("planned interruption journal = %#v, %v", pending, err)
 	}
 	reviewFacadePlannedTransitionHook = original
+	writeReviewStartCandidate(t, repo, "tracked.txt", "later worktree drift\n", 0o644)
 	if err := RunReviewFacadeFinalize(args, io.Discard); err != nil {
 		t.Fatalf("exact replay after planned interruption: %v", err)
 	}

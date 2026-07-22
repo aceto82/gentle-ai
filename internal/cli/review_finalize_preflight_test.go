@@ -3,13 +3,328 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/gentleman-programming/gentle-ai/internal/reviewtransaction"
 )
+
+func TestNegotiatedReviewFinalizeRejectsStaleLiveTargetWithoutMutation(t *testing.T) {
+	tests := []struct {
+		name     string
+		explicit bool
+		breakGit bool
+	}{
+		{name: "explicit stale reviewing lineage", explicit: true},
+		{name: "implicit sole stale reviewing lineage"},
+		{name: "frozen Git evidence is unavailable", explicit: true, breakGit: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := initReviewCLIRepo(t)
+			if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("candidate\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			started, store, resultArgs := startFinalizeLiveTarget(t, repo, "finalize-stale-"+reviewTestSlug(tt.name))
+			record, err := store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.breakGit {
+				object := record.State.CurrentSnapshot.CandidateTree
+				if err := os.Remove(filepath.Join(repo, ".git", "objects", object[:2], object[2:])); err != nil {
+					t.Fatalf("remove frozen candidate tree: %v", err)
+				}
+			} else if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("drifted\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			lineage := ""
+			if tt.explicit {
+				lineage = started.LineageID
+			}
+			assertFinalizeLiveTargetDenied(t, repo, lineage, resultArgs)
+		})
+	}
+}
+
+func TestNegotiatedReviewFinalizeRejectsStaleZeroTransitionWithoutMutation(t *testing.T) {
+	for _, explicit := range []bool{true, false} {
+		name := "implicit sole lineage"
+		if explicit {
+			name = "explicit lineage"
+		}
+		t.Run(name, func(t *testing.T) {
+			repo := initReviewCLIRepo(t)
+			writeReviewStartCandidate(t, repo, "tracked.txt", "candidate\n", 0o644)
+			started, store, resultArgs := startFinalizeLiveTarget(t, repo, "finalize-zero-transition-"+reviewTestSlug(name))
+			args := []string{"finalize", "--contract", ReviewIntegrationContractV1, "--cwd", repo, "--lineage", started.LineageID}
+			args = append(args, resultArgs...)
+			if err := RunReview(args, &bytes.Buffer{}); err != nil {
+				t.Fatalf("advance to validating: %v", err)
+			}
+			record, err := store.Load()
+			if err != nil || record.State.State != reviewtransaction.StateValidating {
+				t.Fatalf("validating authority = %#v, %v", record, err)
+			}
+			writeReviewStartCandidate(t, repo, "tracked.txt", "drifted\n", 0o644)
+			lineage := ""
+			if explicit {
+				lineage = started.LineageID
+			}
+			assertFinalizeLiveTargetDenied(t, repo, lineage, nil)
+		})
+	}
+}
+
+func TestReviewFinalizeAcceptsExactLiveTargetSemantics(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(*testing.T, string) ([]string, func())
+	}{
+		{name: "workspace with intended untracked proof", prepare: func(t *testing.T, repo string) ([]string, func()) {
+			writeReviewStartCandidate(t, repo, "tracked.txt", "workspace\n", 0o644)
+			writeReviewStartCandidate(t, repo, "scope.txt", "included\n", 0o644)
+			return nil, nil
+		}},
+		{name: "staged with unrelated unstaged divergence", prepare: func(t *testing.T, repo string) ([]string, func()) {
+			writeReviewStartCandidate(t, repo, "tracked.txt", "staged\n", 0o644)
+			runReviewCLIGit(t, repo, "add", "tracked.txt")
+			return []string{"--projection", string(reviewtransaction.ProjectionStaged)}, func() {
+				writeReviewStartCandidate(t, repo, "tracked.txt", "unstaged divergence\n", 0o644)
+			}
+		}},
+		{name: "committed base diff with dirty workspace", prepare: func(t *testing.T, repo string) ([]string, func()) {
+			base := strings.TrimSpace(runReviewCLIGit(t, repo, "rev-parse", "HEAD"))
+			writeReviewStartCandidate(t, repo, "tracked.txt", "committed\n", 0o644)
+			runReviewCLIGit(t, repo, "add", "tracked.txt")
+			runReviewCLIGit(t, repo, "commit", "-qm", "candidate")
+			return []string{"--base-ref", base, "--committed-only"}, func() {
+				writeReviewStartCandidate(t, repo, "tracked.txt", "dirty but excluded\n", 0o644)
+			}
+		}},
+		{name: "base workspace overlay", prepare: func(t *testing.T, repo string) ([]string, func()) {
+			base := strings.TrimSpace(runReviewCLIGit(t, repo, "rev-parse", "HEAD"))
+			writeReviewStartCandidate(t, repo, "tracked.txt", "committed\n", 0o644)
+			runReviewCLIGit(t, repo, "add", "tracked.txt")
+			runReviewCLIGit(t, repo, "commit", "-qm", "branch change")
+			writeReviewStartCandidate(t, repo, "tracked.txt", "overlay\n", 0o644)
+			return []string{"--base-ref", base, "--workspace-overlay"}, nil
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := initReviewCLIRepo(t)
+			startArgs, afterStart := tt.prepare(t, repo)
+			started, store, resultArgs := startFinalizeLiveTarget(t, repo, "finalize-exact-"+reviewTestSlug(tt.name), startArgs...)
+			if afterStart != nil {
+				afterStart()
+			}
+			args := []string{"finalize", "--contract", ReviewIntegrationContractV1, "--cwd", repo, "--lineage", started.LineageID}
+			args = append(args, resultArgs...)
+			if err := RunReview(args, &bytes.Buffer{}); err != nil {
+				t.Fatalf("exact FINALIZE failed: %v", err)
+			}
+			record, err := store.Load()
+			if err != nil || record.State.State != reviewtransaction.StateValidating {
+				t.Fatalf("exact FINALIZE authority = %#v, %v", record, err)
+			}
+		})
+	}
+}
+
+func TestReviewFinalizeCrowdedStoreSelectsOnlyFullLiveSnapshotMatch(t *testing.T) {
+	repo := initReviewCLIRepo(t)
+	writeReviewStartCandidate(t, repo, "tracked.txt", "target\n", 0o644)
+	writeReviewStartCandidate(t, repo, "scope.txt", "scope\n", 0o644)
+	_, stale, staleResults := startFinalizeLiveTarget(t, repo, "finalize-crowded-stale")
+	staleRecord, err := stale.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runReviewCLIGit(t, repo, "add", "tracked.txt", "scope.txt")
+	runReviewCLIGit(t, repo, "commit", "-qm", "stale candidate tree")
+	writeReviewStartCandidate(t, repo, "tracked.txt", "intermediate\n", 0o644)
+	runReviewCLIGit(t, repo, "add", "tracked.txt")
+	runReviewCLIGit(t, repo, "commit", "-qm", "new live base")
+	writeReviewStartCandidate(t, repo, "tracked.txt", "target\n", 0o644)
+	live, err := (reviewtransaction.SnapshotBuilder{Repo: repo}).Build(context.Background(), reviewtransaction.Target{
+		Kind: reviewtransaction.TargetCurrentChanges, Projection: reviewtransaction.ProjectionWorkspace, IntendedUntracked: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if live.CandidateTree != staleRecord.State.CurrentSnapshot.CandidateTree || live.BaseTree == staleRecord.State.CurrentSnapshot.BaseTree ||
+		reflect.DeepEqual(live.Paths, staleRecord.State.CurrentSnapshot.Paths) || live.IntendedUntrackedProof == staleRecord.State.CurrentSnapshot.IntendedUntrackedProof {
+		t.Fatalf("fixture does not share only CandidateTree: stale=%#v live=%#v", staleRecord.State.CurrentSnapshot, live)
+	}
+	assertFinalizeLiveTargetDenied(t, repo, staleRecord.State.LineageID, staleResults)
+	changed, err := (reviewtransaction.SnapshotBuilder{Repo: repo}).ChangedLines(context.Background(), live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exactState, err := reviewtransaction.NewCompactState(reviewtransaction.Start{
+		LineageID: "finalize-crowded-exact", Mode: reviewtransaction.ModeOrdinaryBounded, Generation: 1, Snapshot: live,
+		PolicyHash: staleRecord.State.PolicyHash, RiskLevel: staleRecord.State.RiskLevel,
+		SelectedLenses: append([]string{}, staleRecord.State.SelectedLenses...), OriginalChangedLines: &changed,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exact, err := reviewtransaction.CompactAuthoritativeStore(context.Background(), repo, exactState.LineageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exact.Replace("", "review/start", exactState); err != nil {
+		t.Fatal(err)
+	}
+	staleBytes := readReviewOperationFile(t, stale.StatePath())
+	resultArgs := facadeReviewerResultArgs(t, ReviewFacadeStartResult{SelectedLenses: exactState.SelectedLenses})
+	args := []string{"finalize", "--contract", ReviewIntegrationContractV1, "--cwd", repo}
+	args = append(args, resultArgs...)
+	if err := RunReview(args, &bytes.Buffer{}); err != nil {
+		t.Fatalf("crowded exact FINALIZE failed: %v", err)
+	}
+	exactRecord, err := exact.Load()
+	if err != nil || exactRecord.State.State != reviewtransaction.StateValidating {
+		t.Fatalf("crowded exact authority = %#v, %v", exactRecord, err)
+	}
+	if got := readReviewOperationFile(t, stale.StatePath()); !bytes.Equal(got, staleBytes) {
+		t.Fatal("crowded FINALIZE mutated stale lineage")
+	}
+	assertCompactLineageFiles(t, stale, []string{"review-state.json"})
+}
+
+func TestReviewFinalizeConvergesCommittedPendingJournalAfterWorktreeDrift(t *testing.T) {
+	repo := initReviewCLIRepo(t)
+	writeReviewStartCandidate(t, repo, "tracked.txt", "candidate\n", 0o644)
+	started, store, resultArgs := startFinalizeLiveTarget(t, repo, "finalize-pending-drift")
+	args := append([]string{"--cwd", repo, "--lineage", started.LineageID}, resultArgs...)
+	sentinel := errors.New("interrupt after committed transition")
+	original := reviewFacadeCommittedTransitionHook
+	reviewFacadeCommittedTransitionHook = func(_ context.Context, _ string, operation, _ string) error {
+		if operation == "review/complete-review" {
+			return sentinel
+		}
+		return nil
+	}
+	t.Cleanup(func() { reviewFacadeCommittedTransitionHook = original })
+	if err := RunReviewFacadeFinalize(args, &bytes.Buffer{}); !errors.Is(err, sentinel) {
+		t.Fatalf("committed interruption = %v", err)
+	}
+	reviewFacadeCommittedTransitionHook = original
+	committed, err := store.Load()
+	if err != nil || committed.State.State != reviewtransaction.StateValidating {
+		t.Fatalf("committed pending authority = %#v, %v", committed, err)
+	}
+	writeReviewStartCandidate(t, repo, "tracked.txt", "later drift\n", 0o644)
+	if err := RunReviewFacadeFinalize(args, &bytes.Buffer{}); err != nil {
+		t.Fatalf("exact pending replay after drift: %v", err)
+	}
+	after, err := store.Load()
+	if err != nil || after.Revision != committed.Revision || !reflect.DeepEqual(after.State, committed.State) {
+		t.Fatalf("pending replay changed committed authority: before=%#v after=%#v err=%v", committed, after, err)
+	}
+	if pending, err := store.PendingFinalizeAttempt(); err != nil || pending != nil {
+		t.Fatalf("pending replay did not converge journal: %#v, %v", pending, err)
+	}
+}
+
+func TestReviewFinalizeBindsCorrectedRetrySuccessorToLiveFixDiff(t *testing.T) {
+	for _, drift := range []bool{false, true} {
+		name := "exact"
+		if drift {
+			name = "drift denied"
+		}
+		t.Run(name, func(t *testing.T) {
+			fixture := failedCorrectedFinalVerificationCLIFixture(t)
+			successor := "finalize-retry-" + reviewTestSlug(name)
+			if err := RunReview(finalVerificationRetryCLIArgs(t, fixture, successor, fixture.incidentPath), &bytes.Buffer{}); err != nil {
+				t.Fatal(err)
+			}
+			store, err := reviewtransaction.CompactAuthoritativeStore(context.Background(), fixture.repo, successor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			record, err := store.Load()
+			if err != nil || record.State.State != reviewtransaction.StateValidating || record.State.CurrentSnapshot.Kind != reviewtransaction.TargetFixDiff {
+				t.Fatalf("retry successor = %#v, %v", record, err)
+			}
+			evidence := filepath.Join(t.TempDir(), "evidence.txt")
+			if err := os.WriteFile(evidence, []byte("retry verification passed\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if drift {
+				writeReviewStartCandidate(t, fixture.repo, "tracked.txt", "retry drift\n", 0o644)
+			}
+			before := cliReviewAuthoritySnapshot(t, fixture.repo)
+			var output bytes.Buffer
+			err = RunReview([]string{"finalize", "--contract", ReviewIntegrationContractV1, "--cwd", fixture.repo,
+				"--lineage", successor, "--evidence", evidence}, &output)
+			if !drift {
+				if err != nil {
+					t.Fatalf("exact retry FINALIZE: %v", err)
+				}
+				terminal, loadErr := store.Load()
+				if loadErr != nil || terminal.State.State != reviewtransaction.StateApproved {
+					t.Fatalf("exact retry terminal = %#v, %v", terminal, loadErr)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("drifted retry FINALIZE succeeded: %s", output.String())
+			}
+			failure := decodeReviewIntegrationFailure(t, output.Bytes())
+			if failure.Phase != "preflight" || failure.MutationOutcome != ReviewMutationNotStarted || failure.LineageID != successor {
+				t.Fatalf("drifted retry failure = %#v", failure)
+			}
+			if after := cliReviewAuthoritySnapshot(t, fixture.repo); !reflect.DeepEqual(after, before) {
+				t.Fatalf("drifted retry mutated authority: before=%v after=%v", before, after)
+			}
+		})
+	}
+}
+
+func startFinalizeLiveTarget(t *testing.T, repo, lineage string, extra ...string) (ReviewFacadeStartResult, reviewtransaction.CompactStore, []string) {
+	t.Helper()
+	args := []string{"--cwd", repo, "--lineage", lineage}
+	args = append(args, extra...)
+	var output bytes.Buffer
+	if err := RunReviewFacadeStart(args, &output); err != nil {
+		t.Fatal(err)
+	}
+	var started ReviewFacadeStartResult
+	decodeStrictReviewJSON(t, output.Bytes(), &started)
+	store, err := reviewtransaction.CompactAuthoritativeStore(context.Background(), repo, started.LineageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return started, store, facadeReviewerResultArgs(t, started)
+}
+func assertFinalizeLiveTargetDenied(t *testing.T, repo, lineage string, resultArgs []string) {
+	t.Helper()
+	before := cliReviewAuthoritySnapshot(t, repo)
+	args := []string{"finalize", "--contract", ReviewIntegrationContractV1, "--cwd", repo}
+	if lineage != "" {
+		args = append(args, "--lineage", lineage)
+	}
+	args = append(args, resultArgs...)
+	var output bytes.Buffer
+	if err := RunReview(args, &output); err == nil {
+		t.Fatalf("stale FINALIZE succeeded: %s", output.String())
+	}
+	failure := decodeReviewIntegrationFailure(t, output.Bytes())
+	if failure.Operation != ReviewIntegrationOperationFinalize || failure.Phase != "preflight" ||
+		failure.MutationOutcome != ReviewMutationNotStarted || !failure.RetrySafe || lineage != "" && failure.LineageID != lineage {
+		t.Fatalf("stale FINALIZE failure = %#v", failure)
+	}
+	if after := cliReviewAuthoritySnapshot(t, repo); !reflect.DeepEqual(after, before) {
+		t.Fatalf("stale FINALIZE mutated durable authority: before=%v after=%v", before, after)
+	}
+}
 
 func TestNegotiatedReviewFinalizeRejectsReviewerPreflightWithoutAuthorityMutation(t *testing.T) {
 	tests := []struct {

@@ -258,6 +258,33 @@ func (builder SnapshotBuilder) ValidateEvidence(ctx context.Context, snapshot Sn
 	return nil
 }
 
+// ValidateLiveSnapshot proves that a frozen snapshot still describes its exact live target.
+func (builder SnapshotBuilder) ValidateLiveSnapshot(ctx context.Context, expected Snapshot) error {
+	if err := builder.ValidateEvidence(ctx, expected); err != nil {
+		return fmt.Errorf("validate frozen snapshot Git evidence: %w", err)
+	}
+	target := Target{
+		Kind: expected.Kind, Projection: expected.Projection,
+		IntendedUntracked: append([]string{}, expected.IntendedUntracked...),
+		LedgerIDs:         append([]string(nil), expected.LedgerIDs...),
+	}
+	switch expected.Kind {
+	case TargetCurrentChanges:
+	case TargetBaseDiff, TargetBaseWorkspaceOverlay, TargetFixDiff:
+		target.BaseRef = expected.BaseTree
+	default:
+		return fmt.Errorf("unsupported live snapshot target kind %q", expected.Kind)
+	}
+	live, err := builder.Build(ctx, target)
+	if err != nil {
+		return fmt.Errorf("rebuild live snapshot target: %w", err)
+	}
+	if live.UnbornHead != expected.UnbornHead || !snapshotsEqual(live, expected) {
+		return fmt.Errorf("live repository snapshot no longer matches frozen target: expected %s, got %s", expected.Identity, live.Identity)
+	}
+	return nil
+}
+
 func (builder SnapshotBuilder) CandidateLocationSupportsCausality(ctx context.Context, snapshot Snapshot, location string, causality CausalDisposition) (bool, error) {
 	if err := builder.ValidateEvidence(ctx, snapshot); err != nil {
 		return false, err

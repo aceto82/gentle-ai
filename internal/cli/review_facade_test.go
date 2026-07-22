@@ -1402,7 +1402,9 @@ func TestReviewSchemaExamplesMatchStrictFacadeContracts(t *testing.T) {
 				if err := readFacadeJSON(path, &value); err != nil {
 					t.Fatal(err)
 				}
-				if _, err := value.compact(reviewtransaction.EmptyFixDeltaHash, []string{}); err != nil {
+				if _, err := value.compact(reviewtransaction.EmptyFixDeltaHash, []string{}, reviewtransaction.TargetedValidationRequest{
+					RequestHash: reviewtransaction.EmptyFixDeltaHash, CorrectionTargetIdentity: reviewtransaction.EmptyFixDeltaHash,
+				}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -1693,6 +1695,10 @@ func TestReviewBindSDDRequiresExplicitInputs(t *testing.T) {
 	err := RunReview([]string{"bind-sdd", "--cwd", t.TempDir(), "--change", "thin", "--lineage", "approved"}, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "expected-binding-revision") {
 		t.Fatalf("bind-sdd missing explicit CAS input error = %v", err)
+	}
+	err = RunReview([]string{"bind-sdd", "--cwd", t.TempDir(), "--change", "thin", "--lineage", "approved", "--expected-binding-revision", "sha256:deadbeef"}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "empty or sha256") {
+		t.Fatalf("bind-sdd malformed CAS input error = %v", err)
 	}
 }
 

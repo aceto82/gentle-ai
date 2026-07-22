@@ -44,6 +44,31 @@ type storeLock struct {
 // Callers must always Release the lease.
 type MaintenanceLock struct{ lock *storeLock }
 
+// AuthorityFileLock exposes the hardened, platform-specific no-follow lock
+// primitive to adjacent provider-owned authority stores. It preserves kernel
+// advisory ownership as truth and never treats PID metadata as authorization.
+type AuthorityFileLock struct{ lock *storeLock }
+
+// AcquireAuthorityFileLock opens and exclusively locks one private authority
+// lock path using the same no-follow implementation as the review stores.
+func AcquireAuthorityFileLock(path string) (*AuthorityFileLock, error) {
+	lock, err := acquireLocalStoreLock(path)
+	if err != nil {
+		return nil, err
+	}
+	return &AuthorityFileLock{lock: lock}, nil
+}
+
+// Release relinquishes an AuthorityFileLock.
+func (lock *AuthorityFileLock) Release() error {
+	if lock == nil || lock.lock == nil {
+		return nil
+	}
+	err := lock.lock.release()
+	lock.lock = nil
+	return err
+}
+
 func (lock *MaintenanceLock) Release() error {
 	if lock == nil {
 		return nil
@@ -155,6 +180,14 @@ func acquireLocalStoreLock(path string) (*storeLock, error) {
 }
 
 func acquireMaintenanceLock(ctx context.Context, path string, mode maintenanceLockMode) (*MaintenanceLock, error) {
+	return acquireMaintenanceLockInternal(ctx, path, mode, false)
+}
+
+func acquireMaintenanceLockForCompactBatch(ctx context.Context, path string) (*MaintenanceLock, error) {
+	return acquireMaintenanceLockInternal(ctx, path, maintenanceExclusive, true)
+}
+
+func acquireMaintenanceLockInternal(ctx context.Context, path string, mode maintenanceLockMode, allowPreparedBatch bool) (*MaintenanceLock, error) {
 	if err := ensureMaintenanceLockPath(path); err != nil {
 		return nil, err
 	}
@@ -181,7 +214,15 @@ func acquireMaintenanceLock(ctx context.Context, path string, mode maintenanceLo
 			return nil, err
 		}
 		if locked {
-			return &MaintenanceLock{lock: &storeLock{file: file}}, nil
+			lock := &MaintenanceLock{lock: &storeLock{file: file}}
+			if !allowPreparedBatch && filepath.Base(path) == "REVIEW-MAINTENANCE.lock" {
+				base := filepath.Join(filepath.Dir(path), "review-transactions")
+				if err := ensureNoPreparedCompactBatchReconciliation(base); err != nil {
+					_ = lock.Release()
+					return nil, err
+				}
+			}
+			return lock, nil
 		}
 		_ = file.Close()
 		select {

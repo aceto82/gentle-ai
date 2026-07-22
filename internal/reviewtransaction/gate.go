@@ -1250,6 +1250,15 @@ func readGateArtifactPreimages(request GateRequest) (gateArtifactPreimages, erro
 	return result, nil
 }
 
+// rereadGateArtifactPreimages deliberately ignores any request-local preimage
+// cache. Final authorization uses it for path-backed evidence whose current
+// bytes, presence, signature, and trust binding must still match the proof
+// derived earlier in the gate evaluation.
+func rereadGateArtifactPreimages(request GateRequest) (gateArtifactPreimages, error) {
+	request.preimages = nil
+	return readGateArtifactPreimages(request)
+}
+
 func hasArtifactSource(path, content string) bool {
 	return strings.TrimSpace(path) != "" || content != ""
 }

@@ -96,11 +96,21 @@ func TestNegotiatedReviewStatusReportsFreshStartAndPreservesGlobalStatus(t *test
 		t.Fatalf("negotiated status exposed provider-private field %q: %s", field, first.String())
 	}
 
-	fixture, err := os.ReadFile(filepath.Join("..", "..", "contracts", "review-integration", "v1", "fixtures", "status.fixture.json"))
+	fixture, err := os.ReadFile(filepath.Join("..", "..", "contracts", "review-integration", "v1", "fixtures", "status-v2.fixture.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(first.Bytes(), fixture) {
+	var fixtureStatus ReviewTargetStatusResult
+	if err := json.Unmarshal(fixture, &fixtureStatus); err != nil {
+		t.Fatal(err)
+	}
+	gotContext := transitionArgumentValue(t, status.NextTransition, "repository-context")
+	wantContext := transitionArgumentValue(t, fixtureStatus.NextTransition, "repository-context")
+	if err := reviewtransaction.ValidateReviewRepositoryContextHandle(gotContext); err != nil {
+		t.Fatalf("status repository context = %q: %v", gotContext, err)
+	}
+	normalized := bytes.ReplaceAll(first.Bytes(), []byte(gotContext), []byte(wantContext))
+	if !bytes.Equal(normalized, fixture) {
 		t.Fatalf("status fixture mismatch:\ngot=%s\nwant=%s", first.String(), fixture)
 	}
 	var denied bytes.Buffer
@@ -120,6 +130,20 @@ func TestNegotiatedReviewStatusReportsFreshStartAndPreservesGlobalStatus(t *test
 	}
 }
 
+func transitionArgumentValue(t *testing.T, transition *ReviewNextTransition, name string) string {
+	t.Helper()
+	if transition == nil || transition.Collect == nil || len(transition.Collect.Inputs) != 1 {
+		t.Fatalf("transition does not contain exactly one collected input: %#v", transition)
+	}
+	for _, argument := range transition.Collect.Inputs[0].Arguments {
+		if argument.Name == name {
+			return argument.Value
+		}
+	}
+	t.Fatalf("transition does not contain argument %q: %#v", name, transition)
+	return ""
+}
+
 func TestNegotiatedReviewStatusContractAndSchemasAreStrict(t *testing.T) {
 	repo := initReviewCLIRepo(t)
 	var output bytes.Buffer
@@ -135,8 +159,9 @@ func TestNegotiatedReviewStatusContractAndSchemasAreStrict(t *testing.T) {
 		name string
 		id   string
 	}{
-		{name: "status.schema.json", id: ReviewIntegrationStatusSchemaID},
+		{name: "status-v2.schema.json", id: ReviewIntegrationStatusSchemaID},
 		{name: "projection.schema.json", id: ReviewIntegrationProjectionSchemaID},
+		{name: "targeted-validation-request.schema.json", id: reviewtransaction.TargetedValidationRequestSchemaID},
 	} {
 		payload, readErr := os.ReadFile(filepath.Join(root, "schemas", item.name))
 		if readErr != nil {
@@ -154,11 +179,11 @@ func TestNegotiatedReviewStatusContractAndSchemasAreStrict(t *testing.T) {
 		name          string
 		applicability reviewtransaction.TargetApplicability
 	}{
-		{name: "status.fixture.json", applicability: reviewtransaction.TargetApplicabilityCurrent},
-		{name: "status-recover.fixture.json", applicability: reviewtransaction.TargetApplicabilityCurrent},
-		{name: "status-unrelated.fixture.json", applicability: reviewtransaction.TargetApplicabilityUnrelated},
-		{name: "status-ambiguous.fixture.json", applicability: reviewtransaction.TargetApplicabilityAmbiguous},
-		{name: "status-corrupted.fixture.json", applicability: reviewtransaction.TargetApplicabilityCorrupted},
+		{name: "status-v2.fixture.json", applicability: reviewtransaction.TargetApplicabilityCurrent},
+		{name: "status-v2-recover.fixture.json", applicability: reviewtransaction.TargetApplicabilityCurrent},
+		{name: "status-v2-unrelated.fixture.json", applicability: reviewtransaction.TargetApplicabilityUnrelated},
+		{name: "status-v2-ambiguous.fixture.json", applicability: reviewtransaction.TargetApplicabilityAmbiguous},
+		{name: "status-v2-corrupted.fixture.json", applicability: reviewtransaction.TargetApplicabilityCorrupted},
 	}
 	for _, item := range fixtures {
 		fixture, readErr := os.ReadFile(filepath.Join(root, "fixtures", item.name))
@@ -300,8 +325,8 @@ func TestReviewActionEligibilityStopsWithoutCompleteExecutionInputs(t *testing.T
 			Action: action, Replayability: replayability,
 		}
 		status := newReviewTargetStatusResult(native)
-		status.TargetIdentity = "sha256:" + strings.Repeat("b", 64)
 		status.Projection = publishedStatusFixtureProjection(t)
+		status.TargetIdentity = status.Projection.CurrentSnapshotIdentity
 		status.Eligibility = newReviewActionEligibility(status)
 		return status
 	}
@@ -366,7 +391,7 @@ func TestNegotiatedReviewFinalizeEligibilityRequiresTargetScopedStatus(t *testin
 
 func assertStatusPayloadMatchesPublishedSchema(t *testing.T, payload []byte) {
 	t.Helper()
-	schemaPath := filepath.Join("..", "..", "contracts", "review-integration", "v1", "schemas", "status.schema.json")
+	schemaPath := filepath.Join("..", "..", "contracts", "review-integration", "v1", "schemas", "status-v2.schema.json")
 	schemaBytes, err := os.ReadFile(schemaPath)
 	if err != nil {
 		t.Fatal(err)
@@ -581,8 +606,8 @@ func TestNegotiatedStatusBindsRecoveryDispositionToRecoverAction(t *testing.T) {
 			Replayability: reviewtransaction.ReplayabilityManualActionRequired,
 		}
 		result := newReviewTargetStatusResult(native)
-		result.TargetIdentity = "sha256:" + strings.Repeat("b", 64)
 		result.Projection = publishedStatusFixtureProjection(t)
+		result.TargetIdentity = result.Projection.CurrentSnapshotIdentity
 		result.Eligibility = newReviewActionEligibility(result)
 		return result
 	}
@@ -632,8 +657,8 @@ func TestReviewActionEligibilityFailsClosedForEscalatedAuthority(t *testing.T) {
 			Action: action, ActionDisposition: disposition, Replayability: replayability,
 		}
 		status := newReviewTargetStatusResult(native)
-		status.TargetIdentity = "sha256:" + strings.Repeat("b", 64)
 		status.Projection = publishedStatusFixtureProjection(t)
+		status.TargetIdentity = status.Projection.CurrentSnapshotIdentity
 		status.Eligibility = newReviewActionEligibility(status)
 		return status
 	}
@@ -699,7 +724,7 @@ func TestReviewFinalizeEligibilityCannotPublishRecoveryBinding(t *testing.T) {
 
 func publishedStatusFixtureProjection(t *testing.T) ReviewTargetStatusProjection {
 	t.Helper()
-	payload, err := os.ReadFile(filepath.Join("..", "..", "contracts", "review-integration", "v1", "fixtures", "status.fixture.json"))
+	payload, err := os.ReadFile(filepath.Join("..", "..", "contracts", "review-integration", "v1", "fixtures", "status-v2.fixture.json"))
 	if err != nil {
 		t.Fatal(err)
 	}

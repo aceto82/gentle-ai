@@ -1,14 +1,141 @@
 package cli
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/gentleman-programming/gentle-ai/internal/reviewtransaction"
 )
+
+func TestWindowsPowerShell51ArtifactManifestFileFinalize(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires a real binary and Windows PowerShell 5.1")
+	}
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-only PowerShell 5.1 acceptance test")
+	}
+	binary := os.Getenv("GENTLE_AI_TEST_BINARY")
+	if binary == "" {
+		t.Skip("requires GENTLE_AI_TEST_BINARY built from the branch under test")
+	}
+	if _, err := os.Stat(binary); err != nil {
+		t.Fatalf("GENTLE_AI_TEST_BINARY: %v", err)
+	}
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skip("Windows PowerShell is not installed")
+	}
+	version, err := exec.Command(powershell, "-NoProfile", "-NonInteractive", "-Command", `$PSVersionTable.PSEdition + '|' + $PSVersionTable.PSVersion.ToString()`).CombinedOutput()
+	if err != nil {
+		t.Skipf("Windows PowerShell version probe unavailable: %v", err)
+	}
+	if got := strings.TrimSpace(string(version)); !strings.HasPrefix(got, "Desktop|5.1") {
+		t.Skipf("requires Windows PowerShell 5.1, got %q", got)
+	}
+
+	repo := initReviewCLIRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("candidate\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var started ReviewFacadeStartResult
+	decodeBinaryJSON(t, runReviewBinary(t, binary, true, "start", "--cwd", repo), &started)
+	store, err := reviewtransaction.CompactAuthoritativeStore(context.Background(), repo, started.LineageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(record.State.SelectedLenses) != 1 {
+		t.Fatalf("selected lenses = %v, want one", record.State.SelectedLenses)
+	}
+
+	temp := t.TempDir()
+	input := filepath.Join(temp, "reviewer.json")
+	evidence := filepath.Join(temp, "evidence.txt")
+	manifest := filepath.Join(temp, "manifest.json")
+	script := filepath.Join(temp, "finalize.ps1")
+	if err := os.WriteFile(input, powerShell51ReviewerPayloadForTest(t, repo, record, record.State.SelectedLenses[0], 0), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(evidence, []byte("focused artifact transport acceptance passed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const source = `param(
+    [string]$Binary, [string]$Repo, [string]$Lineage, [string]$Target,
+    [string]$Lens, [string]$Order, [string]$ResultPath, [string]$EvidencePath, [string]$Manifest
+)
+$captured = & $Binary review capture-result --cwd $Repo --lineage $Lineage --target $Target --lens $Lens --order $Order --input $ResultPath
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$manifestText = [string]::Join([Environment]::NewLine, [string[]]$captured)
+[System.IO.File]::WriteAllText($Manifest, $manifestText, (New-Object System.Text.UTF8Encoding($true)))
+& $Binary review finalize --cwd $Repo --lineage $Lineage --result-artifact-file $Manifest --evidence $EvidencePath
+exit $LASTEXITCODE
+`
+	if err := os.WriteFile(script, []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script,
+		"-Binary", binary, "-Repo", repo, "-Lineage", started.LineageID, "-Target", record.State.InitialSnapshot.Identity,
+		"-Lens", record.State.SelectedLenses[0], "-Order", "0", "-ResultPath", input, "-EvidencePath", evidence, "-Manifest", manifest)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell 5.1 artifact-file finalize: %v\n%s", err, output)
+	}
+	manifestBytes, err := os.ReadFile(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifestBytes) < 3 || string(manifestBytes[:3]) != "\xef\xbb\xbf" {
+		t.Fatal("PowerShell manifest file does not contain a UTF-8 BOM")
+	}
+	var finalized ReviewFacadeFinalizeResult
+	decodeBinaryJSON(t, output, &finalized)
+	status := binaryReviewStatus(t, binary, repo, started.LineageID)
+	if finalized.State != reviewtransaction.StateApproved || status.Authority == nil || status.Authority.State != reviewtransaction.StateApproved || status.Receipt.Status != ReviewReceiptPresent || status.Receipt.Identity == "" {
+		t.Fatalf("approved status = %#v, finalize = %#v", status, finalized)
+	}
+}
+
+func TestPowerShell51ReviewerPayloadBindsProviderArtifactSubject(t *testing.T) {
+	repo, started, _, record := newArtifactReview(t, false)
+	lens := record.State.SelectedLenses[0]
+	input := filepath.Join(t.TempDir(), "reviewer.json")
+	if err := os.WriteFile(input, powerShell51ReviewerPayloadForTest(t, repo, record, lens, 0), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var output bytes.Buffer
+	if err := RunReviewCaptureResult([]string{
+		"--cwd", repo,
+		"--lineage", started.LineageID,
+		"--target", record.State.InitialSnapshot.Identity,
+		"--lens", lens,
+		"--order", "0",
+		"--input", input,
+	}, &output); err != nil {
+		t.Fatalf("PowerShell reviewer fixture omitted its provider-owned artifact subject: %v", err)
+	}
+	var artifact reviewResultArtifact
+	decodeStrictReviewJSON(t, output.Bytes(), &artifact)
+	if artifact.SubjectHash == "" {
+		t.Fatal("captured PowerShell reviewer fixture has no provider-owned artifact subject")
+	}
+}
+
+func powerShell51ReviewerPayloadForTest(t *testing.T, repo string, record reviewtransaction.CompactRecord, lens string, order int) []byte {
+	t.Helper()
+	return admittedReviewerPayloadForTest(t, repo, record, lens, order,
+		"checked exact target through Windows PowerShell 5.1")
+}
 
 func TestMainBinaryAcceptsCorrectedCandidateFromLinkedWorktree(t *testing.T) {
 	binary := os.Getenv("GENTLE_AI_TEST_BINARY")

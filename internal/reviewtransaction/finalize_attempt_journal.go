@@ -99,6 +99,13 @@ func (store CompactStore) PendingFinalizeAttempt() (*FinalizeAttempt, error) {
 // PendingFinalizeAttemptReadOnly never acquires or rewrites LOCK, so status
 // remains observational even while a writer owns the compact authority.
 func (store CompactStore) PendingFinalizeAttemptReadOnly() (*FinalizeAttempt, error) {
+	maintenance, err := store.acquireReadMaintenance(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	if maintenance != nil {
+		defer maintenance.Release()
+	}
 	payload, err := os.ReadFile(store.FinalizeAttemptJournalPath())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -179,14 +186,6 @@ func sameFinalizeAttemptPayload(left, right FinalizeAttemptRequest) bool {
 		left.ReviewerResultsDigest == right.ReviewerResultsDigest && left.CorrectionForecastDigest == right.CorrectionForecastDigest &&
 		left.ValidationDigest == right.ValidationDigest && left.RefuterDigest == right.RefuterDigest &&
 		left.EvidenceDigest == right.EvidenceDigest && left.FailedDigest == right.FailedDigest
-}
-
-func (store CompactStore) loadCompactRecordLocked() (CompactRecord, error) {
-	payload, err := os.ReadFile(store.StatePath())
-	if err != nil {
-		return CompactRecord{}, err
-	}
-	return parseCompactRecord(payload, store.lineageID)
 }
 
 func finalizeAttemptMayResume(attempt FinalizeAttempt, request FinalizeAttemptRequest, current CompactRecord) bool {

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -340,7 +341,12 @@ func (builder SnapshotBuilder) DiffStats(ctx context.Context, snapshot Snapshot)
 	if err != nil {
 		return nil, err
 	}
-	output, err := runGit(ctx, repo, nil, nil, "diff", "--numstat", "-z", "--no-renames", snapshot.BaseTree, snapshot.CandidateTree, "--")
+	isolation, cleanup, err := isolatedImmutableTreeGit(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	output, err := runGitIsolated(ctx, repo, isolation, nil, "diff", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", snapshot.BaseTree, snapshot.CandidateTree, "--")
 	if err != nil {
 		return nil, err
 	}
@@ -375,7 +381,7 @@ func (builder SnapshotBuilder) DiffStats(ctx context.Context, snapshot Snapshot)
 		}
 		statsByPath[stat.Path] = stat
 	}
-	rawOutput, err := runGit(ctx, repo, nil, nil, "diff", "--raw", "-z", "--no-ext-diff", "--no-textconv", "--no-renames", snapshot.BaseTree, snapshot.CandidateTree, "--")
+	rawOutput, err := runGitIsolated(ctx, repo, isolation, nil, "diff", "--raw", "-z", "--no-ext-diff", "--no-textconv", "--no-renames", "--ignore-submodules=none", snapshot.BaseTree, snapshot.CandidateTree, "--")
 	if err != nil {
 		return nil, err
 	}
@@ -404,6 +410,7 @@ func (builder SnapshotBuilder) DiffStats(ctx context.Context, snapshot Snapshot)
 }
 
 type rawDiffModes struct {
+	status               CandidatePathStatus
 	oldMode, newMode     string
 	oldObject, newObject string
 }
@@ -436,7 +443,8 @@ func parseRawDiffModes(payload []byte) (map[string]rawDiffModes, error) {
 			return nil, fmt.Errorf("duplicate immutable raw diff path %q", logicalPath)
 		}
 		modes[logicalPath] = rawDiffModes{
-			oldMode: oldMode, newMode: newMode, oldObject: string(fields[2]), newObject: string(fields[3]),
+			status: CandidatePathStatus(fields[4]), oldMode: oldMode, newMode: newMode,
+			oldObject: string(fields[2]), newObject: string(fields[3]),
 		}
 	}
 	return modes, nil
@@ -542,6 +550,30 @@ func canonicalRepositoryPath(path string) (string, error) {
 	return filepath.Clean(resolved), nil
 }
 
+func readSnapshotIndex(path string) ([]byte, time.Time, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	defer file.Close()
+	before, err := file.Stat()
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	payload, err := io.ReadAll(file)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	after, err := file.Stat()
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	if before.Size() != after.Size() || before.ModTime() != after.ModTime() || int64(len(payload)) != after.Size() {
+		return nil, time.Time{}, errors.New("real index changed while being copied")
+	}
+	return payload, after.ModTime(), nil
+}
+
 func (builder *SnapshotBuilder) buildCurrentChanges(ctx context.Context, intended []string, allowStagedIntended bool, projection Projection) (string, string, string, error) {
 	baseTree, unborn, err := builder.resolveCurrentChangesBase(ctx, projection)
 	if err != nil {
@@ -556,7 +588,7 @@ func (builder *SnapshotBuilder) buildCurrentChanges(ctx context.Context, intende
 	if !filepath.IsAbs(indexPath) {
 		indexPath = filepath.Join(builder.Repo, indexPath)
 	}
-	indexContent, err := os.ReadFile(indexPath)
+	indexContent, indexModTime, err := readSnapshotIndex(indexPath)
 	missingIndex := errors.Is(err, os.ErrNotExist)
 	if err != nil && !missingIndex {
 		return "", "", "", fmt.Errorf("read real index: %w", err)
@@ -605,8 +637,17 @@ func (builder *SnapshotBuilder) buildCurrentChanges(ctx context.Context, intende
 		if _, err := runGit(ctx, builder.Repo, env, nil, "read-tree", "--empty"); err != nil {
 			return "", "", "", err
 		}
-	} else if err := os.WriteFile(tempIndex, indexContent, 0o600); err != nil {
-		return "", "", "", err
+	} else {
+		if err := os.WriteFile(tempIndex, indexContent, 0o600); err != nil {
+			return "", "", "", err
+		}
+		// Git's racily-clean check compares cached entry timestamps with the
+		// index timestamp. Preserve the real index timestamp: leaving the copied
+		// index freshly dated can make a rapid same-stat rewrite look safely old
+		// and let `git add -u` reuse stale cached content.
+		if err := os.Chtimes(tempIndex, indexModTime, indexModTime); err != nil {
+			return "", "", "", err
+		}
 	}
 	if projection != ProjectionStaged {
 		if _, err := runGit(ctx, builder.Repo, env, nil, "add", "-u", "--", "."); err != nil {
@@ -730,7 +771,7 @@ func (builder SnapshotBuilder) resolveTree(ctx context.Context, revision string)
 }
 
 func (builder SnapshotBuilder) changedPaths(ctx context.Context, baseTree, candidateTree string) ([]string, error) {
-	output, err := runGit(ctx, builder.Repo, nil, nil, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", baseTree, candidateTree)
+	output, err := runGit(ctx, builder.Repo, nil, nil, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--no-renames", "--ignore-submodules=none", baseTree, candidateTree)
 	if err != nil {
 		return nil, err
 	}
@@ -964,6 +1005,23 @@ func (err *GitCommandError) Error() string {
 
 func (err *GitCommandError) Unwrap() error { return err.Cause }
 
+var ErrGitOutputLimit = errors.New("git output exceeded deterministic byte limit")
+
+// GitOutputLimitError reports that a bounded Git capture produced more bytes
+// than the caller permits. The capture retains at most Limit bytes while the
+// child is drained, so oversized output cannot grow process memory without
+// bound.
+type GitOutputLimitError struct {
+	Args  []string
+	Limit int
+}
+
+func (err *GitOutputLimitError) Error() string {
+	return fmt.Sprintf("git %s output exceeds deterministic %d-byte limit", strings.Join(err.Args, " "), err.Limit)
+}
+
+func (err *GitOutputLimitError) Unwrap() error { return ErrGitOutputLimit }
+
 // GitProcessControlError reports that a git subprocess could not be started or
 // its process tree could not be brought under control before it produced any
 // result, e.g. Windows job-object or NtResumeProcess failures. It carries the
@@ -986,6 +1044,21 @@ var gitCommandContext = exec.CommandContext
 var gitProcessTreeStarter = startGitProcessTree
 
 func runGit(ctx context.Context, repo string, extraEnv []string, stdin []byte, args ...string) ([]byte, error) {
+	return runGitCaptured(ctx, repo, extraEnv, stdin, 0, false, args...)
+}
+
+func runGitIsolated(ctx context.Context, repo string, extraEnv []string, stdin []byte, args ...string) ([]byte, error) {
+	return runGitCaptured(ctx, repo, extraEnv, stdin, 0, true, args...)
+}
+
+func runGitLimited(ctx context.Context, repo string, extraEnv []string, stdin []byte, outputLimit int, args ...string) ([]byte, error) {
+	if outputLimit <= 0 {
+		return nil, &GitOutputLimitError{Args: append([]string{}, args...), Limit: outputLimit}
+	}
+	return runGitCaptured(ctx, repo, extraEnv, stdin, outputLimit, true, args...)
+}
+
+func runGitCaptured(ctx context.Context, repo string, extraEnv []string, stdin []byte, outputLimit int, isolateConfig bool, args ...string) ([]byte, error) {
 	remote := len(args) > 0 && args[0] == "ls-remote"
 	timeout := localGitCommandTimeout
 	if remote {
@@ -996,12 +1069,19 @@ func runGit(ctx context.Context, repo string, extraEnv []string, stdin []byte, a
 	command := gitCommandContext(commandContext, "git", append([]string{"--no-replace-objects", "-C", repo}, args...)...)
 	command.Cancel = nil
 	command.WaitDelay = gitCommandWaitDelay
-	command.Env = sanitizedGitEnvironment(os.Environ(), extraEnv)
+	command.Env = sanitizedGitEnvironmentForRun(os.Environ(), extraEnv, isolateConfig)
 	if stdin != nil {
 		command.Stdin = bytes.NewReader(stdin)
 	}
-	var buffer bytes.Buffer
-	command.Stdout, command.Stderr = &buffer, &buffer
+	var combined bytes.Buffer
+	var stdout, stderr *boundedGitOutput
+	if outputLimit > 0 {
+		stdout = &boundedGitOutput{limit: outputLimit}
+		stderr = &boundedGitOutput{limit: 64 << 10}
+		command.Stdout, command.Stderr = stdout, stderr
+	} else {
+		command.Stdout, command.Stderr = &combined, &combined
+	}
 	release, startErr := gitProcessTreeStarter(command)
 	err := startErr
 	if err == nil {
@@ -1021,7 +1101,10 @@ func runGit(ctx context.Context, repo string, extraEnv []string, stdin []byte, a
 		_ = command.Process.Kill()
 		_ = command.Wait()
 	}
-	output := buffer.Bytes()
+	output, diagnostic := combined.Bytes(), combined.Bytes()
+	if stdout != nil {
+		output, diagnostic = stdout.Bytes(), stderr.Bytes()
+	}
 	if errors.Is(err, exec.ErrWaitDelay) && commandContext.Err() == nil {
 		err = nil
 	}
@@ -1046,13 +1129,43 @@ func runGit(ctx context.Context, repo string, extraEnv []string, stdin []byte, a
 		}
 		return nil, &GitCommandError{
 			Args: append([]string{}, args...), ExitCode: exitCode, Remote: remote, Cause: err,
-			Output: strings.TrimSpace(string(output)),
+			Output: strings.TrimSpace(string(diagnostic)),
 		}
+	}
+	if stdout != nil && stdout.exceeded {
+		return nil, &GitOutputLimitError{Args: append([]string{}, args...), Limit: outputLimit}
 	}
 	return output, nil
 }
 
+type boundedGitOutput struct {
+	buffer   bytes.Buffer
+	limit    int
+	exceeded bool
+}
+
+func (output *boundedGitOutput) Write(payload []byte) (int, error) {
+	written := len(payload)
+	remaining := output.limit - output.buffer.Len()
+	if remaining > 0 {
+		if remaining > len(payload) {
+			remaining = len(payload)
+		}
+		_, _ = output.buffer.Write(payload[:remaining])
+	}
+	if len(payload) > remaining {
+		output.exceeded = true
+	}
+	return written, nil
+}
+
+func (output *boundedGitOutput) Bytes() []byte { return output.buffer.Bytes() }
+
 func sanitizedGitEnvironment(environment, extra []string) []string {
+	return sanitizedGitEnvironmentForRun(environment, extra, false)
+}
+
+func sanitizedGitEnvironmentForRun(environment, extra []string, isolateConfig bool) []string {
 	unsafe := map[string]struct{}{
 		"GIT_ALTERNATE_OBJECT_DIRECTORIES": {},
 		"GIT_CEILING_DIRECTORIES":          {},
@@ -1075,7 +1188,9 @@ func sanitizedGitEnvironment(environment, extra []string) []string {
 	result := make([]string, 0, len(environment)+len(extra)+1)
 	for _, entry := range environment {
 		name, _, _ := strings.Cut(entry, "=")
-		if _, remove := unsafe[name]; !remove && name != "LC_ALL" {
+		_, remove := unsafe[name]
+		isolatedOverride := isolateConfig && (strings.HasPrefix(name, "GIT_CONFIG_") || strings.HasPrefix(name, "GIT_ATTR_") || name == "GIT_DIFF_OPTS")
+		if !remove && name != "LC_ALL" && !isolatedOverride {
 			result = append(result, entry)
 		}
 	}

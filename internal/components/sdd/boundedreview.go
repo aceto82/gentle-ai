@@ -11,6 +11,7 @@ import (
 const boundedReviewContractAsset = "skills/_shared/review-ledger-contract.md"
 
 const nativeReviewerResultSchema = `{"findings":[{"location":"path:line","severity":"CRITICAL","claim":"observable incorrect behavior","evidence_class":"deterministic","causal_disposition":"introduced","proof_refs":["concrete proof"]}],"evidence":["what was inspected"]}`
+const providerReviewerResultSchema = `{"subject_hash":"<artifact_subject.subject_hash>","inspection":{"status":"completed","paths":["<every changed_path_manifest.path in exact order>"]},"findings":[{"location":"path:line","severity":"CRITICAL","claim":"observable incorrect behavior","evidence_class":"deterministic","causal_disposition":"introduced","proof_refs":["concrete proof"]}],"evidence":["what was inspected"]}`
 
 type reviewerRole struct {
 	title string
@@ -120,7 +121,7 @@ func reviewerPrompt(name string) (string, bool) {
 	}
 	prompt := fmt.Sprintf(`# %s Review
 
-You are a read-only reviewer. Inspect the immutable candidate diff once, return one result, and stop. Do not edit, delegate, or expand beyond the candidate and the minimum base context needed for proof.
+You are a read-only reviewer. Inspect the immutable candidate diff once, return one result, and stop. Do not edit, delegate, or inspect unrelated scope.
 
 ## Scope
 
@@ -128,18 +129,18 @@ You are a read-only reviewer. Inspect the immutable candidate diff once, return 
 
 ## Candidate-Causal Admission
 
-Report a finding only for real, user-impacting incorrect behavior. Classify it as introduced, behavior-activated, worsened, pre-existing, base-only, or unknown. A BLOCKER or CRITICAL finding requires proof that a candidate hunk introduced or worsened the behavior, created a path to it, or fails a differential test that passes on base. Use pre-existing or base-only when the candidate did not activate the defect, and unknown when causality cannot be proved. Style preferences and unsupported suspicion are not findings.
+Report only real user-impacting defects. Set causal_disposition. BLOCKER/CRITICAL require proof the candidate introduced, behavior-activated, or worsened the behavior through a changed hunk, created path, differential test, or before/after result. Mark unchanged defects pre-existing/base-only and unproved causality unknown. Style or suspicion is not a finding.
 
 ## Severity
 
-- BLOCKER: unsafe to deliver; catastrophic impact or no viable recovery.
+- BLOCKER: catastrophic impact or no viable recovery.
 - CRITICAL: material user, security, data, or correctness failure.
 - WARNING: proven non-blocking defect or follow-up risk.
-- SUGGESTION: optional improvement with concrete value.
+- SUGGESTION: optional concrete improvement.
 
 ## Evidence
 
-Each finding needs one exact path:line location, a neutral observable claim, deterministic | inferential | insufficient evidence class, causal disposition, and concrete proof references such as a changed hunk, command/output, differential test, trace, or before/after behavior. Do not invent evidence or use placeholders.
+Each finding needs exact path:line, a neutral claim, deterministic | inferential | insufficient evidence class, causal disposition, and concrete proof. Never invent evidence or use placeholders.
 
 ## Output
 
@@ -147,9 +148,9 @@ Return one JSON object and no prose. Use exactly this native result shape:
 
 %s
 
-The only allowed top-level fields are findings and evidence, and the only allowed finding fields are location, severity, claim, evidence_class, causal_disposition, and proof_refs. Never emit summary, skill_resolution, or any other unknown field. Keep orchestration metadata outside the native result JSON; evidence contains only genuine inspection evidence.
+Echo the bound subject hash. Complete inspection only after reading every manifest path, in exact order. The only allowed top-level fields are subject_hash, inspection, findings, and evidence; finding fields are location, severity, claim, evidence_class, causal_disposition, and proof_refs. Never emit summary, skill_resolution, or any other unknown field. Keep orchestration metadata outside the native result JSON; evidence contains only genuine inspection evidence.
 
-Return {"findings":[],"evidence":["what was inspected"]} when clean.`, role.title, role.focus, nativeReviewerResultSchema)
+Return the same subject_hash and inspection with {"findings":[],"evidence":["what was inspected"]} when clean.`, role.title, role.focus, providerReviewerResultSchema)
 	return prompt, true
 }
 

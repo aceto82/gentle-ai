@@ -148,6 +148,25 @@ func TestNegotiatedReviewFailuresPreserveRequestedLineage(t *testing.T) {
 	}
 }
 
+func TestNegotiatedBindSDDClassifiesBindingRevisionConflictBeforePublication(t *testing.T) {
+	expected := "sha256:" + strings.Repeat("a", 64)
+	failure := newReviewIntegrationFailure(
+		ReviewIntegrationOperationBindSDD,
+		[]string{"--cwd", ".", "--change", "thin", "--lineage", "review-thin", "--expected-binding-revision", expected},
+		&sddstatus.BindingRevisionConflictError{Expected: expected, Current: ""},
+	)
+	if failure.Code != "binding_revision_conflict" || failure.Phase != "pre_native" ||
+		failure.MutationOutcome != ReviewMutationNotStarted || !failure.RetrySafe ||
+		failure.Replayability != reviewtransaction.ReplayabilityNotReplayable || failure.NextAction != ReviewIntegrationOperationBindSDD ||
+		failure.Context == nil || failure.Context.BindingRevision == nil || failure.Context.BindingRevision.Expected != expected ||
+		failure.Context.BindingRevision.Current != "" {
+		t.Fatalf("typed binding conflict failure = %#v", failure)
+	}
+	if err := failure.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestNegotiatedFailureLineageUsesCanonicalFlagParsing(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -766,6 +785,37 @@ func TestReviewIntegrationFailureSchemaAndFixtureAreStrict(t *testing.T) {
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&ReviewIntegrationFailure{}); err == nil {
 		t.Fatal("strict failure decoder accepted a private scope-change field")
+	}
+
+	bindingFixture, err := os.ReadFile(filepath.Join(root, "fixtures", "binding-revision-conflict.fixture.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindingFailure := decodeReviewIntegrationFailure(t, bindingFixture)
+	if bindingFailure.Operation != ReviewIntegrationOperationBindSDD || bindingFailure.Code != "binding_revision_conflict" ||
+		bindingFailure.Phase != "pre_native" || bindingFailure.MutationOutcome != ReviewMutationNotStarted ||
+		bindingFailure.Context == nil || bindingFailure.Context.BindingRevision == nil ||
+		bindingFailure.Context.BindingRevision.Expected != "sha256:"+strings.Repeat("a", 64) ||
+		bindingFailure.Context.BindingRevision.Current != "" {
+		t.Fatalf("binding revision conflict fixture = %#v", bindingFailure)
+	}
+	bindingFailure.Context.BindingRevision.Expected = "invalid"
+	if err := bindingFailure.Validate(); err == nil {
+		t.Fatal("binding revision conflict fixture accepted a malformed expected revision")
+	}
+	var bindingRaw map[string]any
+	if err := json.Unmarshal(bindingFixture, &bindingRaw); err != nil {
+		t.Fatal(err)
+	}
+	bindingRaw["context"].(map[string]any)["binding_revision"].(map[string]any)["authority_revision"] = "sha256:" + strings.Repeat("b", 64)
+	malformedBinding, err := json.Marshal(bindingRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindingDecoder := json.NewDecoder(bytes.NewReader(malformedBinding))
+	bindingDecoder.DisallowUnknownFields()
+	if err := bindingDecoder.Decode(&ReviewIntegrationFailure{}); err == nil {
+		t.Fatal("strict failure decoder accepted a private binding-revision field")
 	}
 }
 

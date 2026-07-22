@@ -72,6 +72,10 @@
         "reason_code": "forbidden_required_inputs_unavailable"
       },
       {
+        "action": "review.reconcile-authority-batch",
+        "reason_code": "forbidden_required_inputs_unavailable"
+      },
+      {
         "action": "review.recover",
         "reason_code": "forbidden_required_inputs_unavailable"
       },
@@ -106,6 +110,10 @@
             {
               "name": "target",
               "value": "sha256:e6faad1cb9ceb2db170e0ec9ea5394b44c3991dff6cbd02fb6787539715968f6"
+            },
+            {
+              "name": "repository-context",
+              "value": "rctx1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             },
             {
               "name": "lens",

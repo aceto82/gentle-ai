@@ -2,10 +2,12 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -106,6 +108,62 @@ func TestNegotiatedNextTransitionDiscoversCapturedArtifactsAndAdvances(t *testin
 	}
 }
 
+func TestNegotiatedRestartStatusSuppliesFrozenContextForEveryMissingReviewer(t *testing.T) {
+	repo, started, _, record := newArtifactReview(t, true)
+	var output bytes.Buffer
+	if err := RunReview([]string{
+		"status", "--contract", ReviewIntegrationContractV1, "--next-transition",
+		"--cwd", repo, "--lineage", started.LineageID,
+	}, &output); err != nil {
+		t.Fatal(err)
+	}
+	var status ReviewTargetStatusResult
+	decodeStrictReviewJSON(t, output.Bytes(), &status)
+	if status.NextTransition == nil || status.NextTransition.Collect == nil ||
+		len(status.NextTransition.Collect.Inputs) != len(record.State.SelectedLenses) {
+		t.Fatalf("restart transition = %#v", status.NextTransition)
+	}
+	wantContext, err := (reviewtransaction.SnapshotBuilder{Repo: repo}).FrozenCandidateContext(context.Background(), record.State.InitialSnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for order, input := range status.NextTransition.Collect.Inputs {
+		payload, err := json.Marshal(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var document map[string]json.RawMessage
+		if err := json.Unmarshal(payload, &document); err != nil {
+			t.Fatal(err)
+		}
+		for _, field := range []string{"artifact_subject", "candidate_diff", "changed_path_manifest"} {
+			if len(document[field]) == 0 {
+				t.Fatalf("restart reviewer input %d omits %q: %s", order, field, payload)
+			}
+		}
+		var subject reviewtransaction.ArtifactSubject
+		var diff reviewtransaction.FrozenCandidateDiff
+		var manifest []reviewtransaction.ChangedPathManifestEntry
+		if err := json.Unmarshal(document["artifact_subject"], &subject); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(document["candidate_diff"], &diff); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(document["changed_path_manifest"], &manifest); err != nil {
+			t.Fatal(err)
+		}
+		if subject.LineageID != record.State.LineageID || subject.AuthorityRevision != record.Revision ||
+			subject.TargetIdentity != record.State.InitialSnapshot.Identity || subject.Lens != record.State.SelectedLenses[order] ||
+			subject.SelectedOrder != order || subject.CandidateDiffSHA256 != wantContext.CandidateDiff.SHA256 {
+			t.Fatalf("restart subject %d = %#v", order, subject)
+		}
+		if !reflect.DeepEqual(diff, wantContext.CandidateDiff) || !reflect.DeepEqual(manifest, wantContext.ChangedPathManifest) {
+			t.Fatalf("restart context %d differs from frozen candidate\ngot diff=%#v manifest=%#v\nwant diff=%#v manifest=%#v", order, diff, manifest, wantContext.CandidateDiff, wantContext.ChangedPathManifest)
+		}
+	}
+}
+
 func TestReviewNextTransitionStateTable(t *testing.T) {
 	status := func(applicability reviewtransaction.TargetApplicability, state reviewtransaction.State, action reviewtransaction.TargetStatusAction, replayability reviewtransaction.Replayability) ReviewTargetStatusResult {
 		return ReviewTargetStatusResult{
@@ -144,6 +202,10 @@ func TestReviewNextTransitionStateTable(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			input := reviewNextTransitionInput{}
+			if tt.status.Authority != nil && tt.status.Authority.State == reviewtransaction.StateReviewing {
+				input.RepositoryContext = "rctx1_" + strings.Repeat("d", 64)
+				input.CaptureContext = nextTransitionTestCaptureContext(t, tt.status, tt.lenses)
+			}
 			if tt.status.Authority.State == reviewtransaction.StateApproved {
 				tt.status.Receipt.Status = ReviewReceiptPresent
 			}
@@ -163,6 +225,32 @@ func TestReviewNextTransitionStateTable(t *testing.T) {
 			}
 		})
 	}
+}
+
+func nextTransitionTestCaptureContext(t *testing.T, status ReviewTargetStatusResult, lenses []string) *reviewCaptureContext {
+	t.Helper()
+	diff, err := reviewtransaction.NewFrozenCandidateDiff([]byte("immutable candidate\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozen := reviewtransaction.FrozenCandidateContext{
+		CandidateDiff: diff,
+		ChangedPathManifest: []reviewtransaction.ChangedPathManifestEntry{{
+			Path: "tracked.txt", Status: reviewtransaction.CandidatePathModified, OldMode: "100644", NewMode: "100644",
+		}},
+	}
+	state := reviewtransaction.CompactState{
+		LineageID: status.Authority.LineageID,
+		InitialSnapshot: reviewtransaction.Snapshot{
+			Identity: status.TargetIdentity, Paths: []string{"tracked.txt"},
+		},
+		SelectedLenses: append([]string{}, lenses...),
+	}
+	context, err := newReviewCaptureContext(state, status.Authority.Revision, frozen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return context
 }
 
 func TestReviewNextTransitionRefusesTargetDriftAndUnverifiableCaptures(t *testing.T) {

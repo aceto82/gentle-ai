@@ -112,6 +112,12 @@ func InventoryAuthority(ctx context.Context, repo string) (AuthorityStatusReport
 		report.Diagnostics = append(report.Diagnostics, AuthorityInventoryDiagnostic{Path: root, Problem: "inspect review authority root: " + err.Error()})
 		return report, nil
 	}
+	if err := ensureNoPreparedCompactBatchReconciliation(root); err != nil {
+		report.Complete, report.Authoritative, report.Status = false, false, AuthorityStatusInvalid
+		report.Diagnostics = append(report.Diagnostics, AuthorityInventoryDiagnostic{
+			Path: compactBatchReconcileMarkerPath(root), Problem: ErrCompactBatchReconcilePrepared.Error(),
+		})
+	}
 
 	legacy := inventoryVersion(ctx, repository, root, "v1", AuthorityVersionLegacy)
 	compact := inventoryVersion(ctx, repository, root, "v2", AuthorityVersionCompact)

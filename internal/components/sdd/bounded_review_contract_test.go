@@ -15,7 +15,9 @@ var boundedReviewRequiredClauses = []string{
 	"gentle-ai review start",
 	"selected lens once in the foreground",
 	"gentle-ai review capture-result",
-	"repeated `--result-artifact '<manifest-json>'` arguments",
+	"repeated `--result-artifact-file <path>` arguments",
+	"BOM-less UTF-8 on Windows PowerShell 5.1",
+	"POSIX inline `--result-artifact '<manifest-json>'` form remains compatible",
 	"Native Go validates, canonicalizes, persists, hashes, reopens, and binds results",
 	"Only `introduced`, `behavior-activated`, or `worsened`",
 	"Route `pre-existing` and `base-only` to follow-ups; `unknown` escalates",
@@ -75,7 +77,7 @@ func TestRenderedReviewersAreReadOnlyAndSingleResult(t *testing.T) {
 			path := family + "/agents/review-" + lens + ".md"
 			t.Run(family+"/"+lens, func(t *testing.T) {
 				content := renderBoundedReviewAsset(path)
-				for _, want := range []string{"read-only reviewer", "immutable candidate diff once", "## Candidate-Causal Admission", "Return one JSON object and no prose", nativeReviewerResultSchema, "Never emit summary, skill_resolution, or any other unknown field", "evidence contains only genuine inspection evidence"} {
+				for _, want := range []string{"read-only reviewer", "immutable candidate diff once", "## Candidate-Causal Admission", "Return one JSON object and no prose", `"subject_hash":"<artifact_subject.subject_hash>"`, `"inspection":{"status":"completed","paths":["<every changed_path_manifest.path in exact order>"]}`, "Never emit summary, skill_resolution, or any other unknown field", "evidence contains only genuine inspection evidence"} {
 					if !strings.Contains(content, want) {
 						t.Errorf("%s missing %q", path, want)
 					}

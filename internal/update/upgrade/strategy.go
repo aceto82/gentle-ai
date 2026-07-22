@@ -59,7 +59,7 @@ const maxScriptSize = 1 * 1024 * 1024 // 1 MB
 //   - brew profile → brewUpgrade (regardless of tool's declared method)
 //   - go-install method + apt/pacman/other → goInstallUpgrade
 //   - binary method + linux/darwin → binaryUpgrade
-//   - binary method + windows → manualFallback (gentle-ai on Windows uses installerUpgrade instead)
+//   - binary method + windows → manualFallback (gentle-ai explains the signed-distribution hold)
 //   - script method + linux/darwin + gga → ggaScriptUpgrade (git clone approach)
 //   - script method + linux/darwin + other → scriptUpgrade (curl | bash install.sh)
 //   - script method + windows → manualFallback
@@ -90,8 +90,6 @@ func runStrategy(ctx context.Context, r update.UpdateResult, profile system.Plat
 		return false, goInstallUpgrade(ctx, r.Tool, r.LatestVersion)
 	case update.InstallBinary:
 		return false, binaryUpgrade(ctx, r, profile)
-	case update.InstallInstaller:
-		return installerUpgrade(ctx, r.Tool, r.ReleaseURL, isBetaGentleAIUpgrade(r))
 	case update.InstallScript:
 		// GGA's install.sh expects to run from within a cloned repo — it references
 		// $SCRIPT_DIR/bin/gga and $SCRIPT_DIR/lib/*.sh. The generic scriptUpgrade
@@ -550,10 +548,13 @@ func prependGoPattern(existing, pattern string) string {
 // binaryUpgrade handles binary-release upgrades via GitHub Releases asset download.
 //
 // engram has its own cross-platform binary downloader (DownloadLatestBinary) that
-// works on all platforms including Windows. For tools besides engram and gentle-ai
-// on Windows, a ManualFallbackError is returned so the executor surfaces it as
-// UpgradeSkipped with an actionable hint. (gentle-ai uses InstallInstaller).
+// works on all platforms including Windows. Other Windows binary upgrades return
+// ManualFallbackError so the executor surfaces them as UpgradeSkipped.
 func binaryUpgrade(ctx context.Context, r update.UpdateResult, profile system.PlatformProfile) error {
+	if profile.OS == "windows" && r.Tool.Name == "gentle-ai" {
+		return &ManualFallbackError{Hint: gentleAIWindowsSourceInstallHint(r)}
+	}
+
 	// engram: always use its dedicated binary downloader regardless of platform
 	// (except brew, which is handled by effectiveMethod before we get here).
 	if r.Tool.Name == "engram" {
@@ -577,85 +578,10 @@ func binaryUpgrade(ctx context.Context, r update.UpdateResult, profile system.Pl
 	return downloadAndReplace(ctx, r, profile)
 }
 
-// installerUpgradeArgs builds the PowerShell command argument list for launching
-// install.ps1 as a detached process. When beta is true, "-Channel beta" is
-// appended after "-File <tmpPath>" so install.ps1 routes to go install @main
-// instead of downloading the latest stable release binary.
-func installerUpgradeArgs(tmpPath string, beta bool) []string {
-	args := []string{
-		"/C",
-		"start",
-		"",
-		"powershell",
-		"-NoProfile",
-		"-NoExit",
-		"-ExecutionPolicy", "Bypass",
-		"-File", tmpPath,
-	}
-	if beta {
-		args = append(args, "-Channel", "beta")
-	}
-	return args
-}
-
-// installerUpgrade launches the PowerShell installer (install.ps1) for gentle-ai on Windows.
-// This is used for the Windows self-replace workaround — the running process
-// exits immediately after launching the installer, which then replaces the binary.
-// When beta is true, "-Channel beta" is passed to install.ps1 so it installs
-// from HEAD via go install @main instead of downloading the latest stable release.
-func installerUpgrade(ctx context.Context, tool update.ToolInfo, releaseURL string, beta bool) (bool, error) {
-	if runtime.GOOS != "windows" {
-		return false, fmt.Errorf("installer upgrade is only supported on Windows")
-	}
-
-	scriptURL := fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/main/scripts/install.ps1", tool.Owner, tool.Repo)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, scriptURL, nil)
-	if err != nil {
-		return false, fmt.Errorf("download install.ps1: build request: %w", err)
-	}
-
-	resp, err := scriptHTTPClient.Do(req)
-	if err != nil {
-		return false, fmt.Errorf("download install.ps1: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("download install.ps1: HTTP %d from %s", resp.StatusCode, scriptURL)
-	}
-
-	scriptBody, err := io.ReadAll(io.LimitReader(resp.Body, maxScriptSize+1))
-	if err != nil {
-		return false, fmt.Errorf("download install.ps1: read body: %w", err)
-	}
-	if int64(len(scriptBody)) > maxScriptSize {
-		return false, fmt.Errorf("download install.ps1: response body exceeds %d bytes limit", maxScriptSize)
-	}
-
-	// Write to a temporary file instead of passing it to iex directly
-	tmpFile, err := os.CreateTemp("", "gentle-ai-install-*.ps1")
-	if err != nil {
-		return false, fmt.Errorf("create temp script: %w", err)
-	}
-	if _, err := tmpFile.Write(scriptBody); err != nil {
-		tmpFile.Close()
-		return false, fmt.Errorf("write temp script: %w", err)
-	}
-	tmpFile.Close()
-
-	cmd := execCommand("cmd", installerUpgradeArgs(tmpFile.Name(), beta)...)
-
-	fmt.Printf("\nLaunching installer for %s...\n", tool.Name)
-	fmt.Println("gentle-ai will now exit so the installer can replace the binary.")
-
-	if err := cmd.Start(); err != nil {
-		return false, fmt.Errorf("failed to start installer: %w", err)
-	}
-
-	// Mark that we need to exit after the spinner is handled by the caller.
-	// This allows the executor to call sp.Finish(true) before we actually exit.
-	return true, nil
+func gentleAIWindowsSourceInstallHint(r update.UpdateResult) string {
+	return update.WindowsDistributionHoldMessage + " " +
+		"No binary or remote script was downloaded or executed. Install/update from source with Go 1.25.10+:\n  " +
+		update.GentleAISourceInstallCommand(r.LatestVersion)
 }
 
 // engramBinaryUpgrade downloads or installs the latest engram binary.

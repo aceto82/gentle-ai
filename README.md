@@ -17,6 +17,15 @@
 
 ---
 
+> [!IMPORTANT]
+> **RDD is unstable.** Receipt-Driven Development started in `gentle-ai` `v1.47.0`. Every release from `v1.47.0` onward is part of the RDD development line and may change while remaining issues are fixed.
+>
+> For a stable installation without RDD, use the last version before RDD, `v1.46.0`:
+> ```bash
+> go install github.com/gentleman-programming/gentle-ai/cmd/gentle-ai@v1.46.0
+> ```
+> To test the latest released RDD build, use `@latest`. Use `@main` only for unreleased development changes. See the [full RDD version policy](docs/quickstart.md#version-policy).
+
 ## What It Does
 
 Gentle-AI is NOT an AI agent installer. Most agents are easy to install. It is an **ecosystem configurator** that equips the AI coding agent(s) you already use with persistent memory, Spec-Driven Development (SDD), curated skills, MCP servers, model routing, a teaching-oriented persona, and bounded native review.
@@ -81,10 +90,11 @@ curl -fsSL https://raw.githubusercontent.com/Gentleman-Programming/gentle-ai/mai
 **Windows (PowerShell)**
 
 ```powershell
-irm https://raw.githubusercontent.com/Gentleman-Programming/gentle-ai/main/scripts/install.ps1 | iex
+go install github.com/gentleman-programming/gentle-ai/cmd/gentle-ai@latest
 ```
 
-The managed installer works with Gentle AI's built-in updater; on Windows it installs to `%LOCALAPPDATA%\gentle-ai\bin`.
+> [!WARNING]
+> Windows source builds and CI/runtime tests remain supported, but official Windows binary distribution and Scoop are temporarily unavailable. Windows installation and upgrades require Go 1.25.10+ and fail closed to source-install guidance; they never download an unsigned Gentle AI executable or execute a remote update script.
 
 ### Configure project context
 
@@ -110,18 +120,13 @@ brew trust --formula gentleman-programming/tap/gentle-ai  # one-time, for Homebr
 brew install gentle-ai
 ```
 
-**Go install (any platform with Go 1.25.10+)**
+**Go install, stable pin (any platform with Go 1.25.10+)**
 
 ```bash
-go install github.com/gentleman-programming/gentle-ai/cmd/gentle-ai@latest
+go install github.com/gentleman-programming/gentle-ai/cmd/gentle-ai@v1.46.0
 ```
 
-**Scoop (Windows)** — this is a manual-update path; update it with `scoop update gentle-ai`.
-
-```powershell
-scoop bucket add gentleman https://github.com/Gentleman-Programming/scoop-bucket
-scoop install gentle-ai
-```
+**Scoop (Windows)** — temporarily unavailable while official Windows binary distribution is held for public-trust Authenticode signing. Use the Windows `go install` command above.
 
 By default, `gentle-ai install` writes agent-scoped files to each selected agent's global config directory. To keep the Gentleman stack isolated to one project, run:
 
@@ -138,8 +143,37 @@ Workspace scope applies to selected agents for agent-scoped files such as system
 curl -fsSL https://raw.githubusercontent.com/Gentleman-Programming/gentle-ai/main/scripts/install.sh | bash -s -- --channel beta
 
 # Windows (PowerShell)
-$env:GENTLE_AI_CHANNEL="beta"; irm https://raw.githubusercontent.com/Gentleman-Programming/gentle-ai/main/scripts/install.ps1 | iex
+$env:GENTLE_AI_CHANNEL="beta"; go install github.com/gentleman-programming/gentle-ai/cmd/gentle-ai@main
 ```
+
+### RDD version policy
+
+Receipt-Driven Development (RDD) started in `gentle-ai` `v1.47.0` on 2026-07-10, with the first bounded native review transactions. Every release from `v1.47.0` onward is part of the unstable RDD development line. New releases will continue improving RDD until the project declares the line stable. The stable version for normal use without RDD is the last release before RDD, `v1.46.0`.
+
+Use `@latest` when you want to try the latest released RDD build. Use `@main` only when you explicitly want unreleased RDD development changes. The negotiated public review contract was published in `v2.1.6`.
+
+**Stable version (`v1.46.0`)**
+
+```bash
+go install github.com/gentleman-programming/gentle-ai/cmd/gentle-ai@v1.46.0
+gentle-ai version
+```
+
+**Latest released RDD build (unstable)**
+
+```bash
+go install github.com/gentleman-programming/gentle-ai/cmd/gentle-ai@latest
+gentle-ai version
+```
+
+**Unreleased RDD development build (`main`)**
+
+```bash
+go install github.com/gentleman-programming/gentle-ai/cmd/gentle-ai@main
+gentle-ai version
+```
+
+The managed installer tracks the channel's latest version and does not accept an arbitrary release pin. Use `go install` when reproducibility requires an exact version.
 
 </details>
 
@@ -160,6 +194,22 @@ $env:GENTLE_AI_CHANNEL="beta"; irm https://raw.githubusercontent.com/Gentleman-P
    gentle-ai upgrade
    gentle-ai sync
    ```
+
+### Release verification
+
+Official macOS and Linux release archives require an authenticated `checksums.txt`. The built-in upgrader verifies its Minisign signature, its exact `Gentleman-Programming/gentle-ai` + release-tag binding, and the selected archive checksum **before** replacing the installed binary. Release archives are capped at **128 MiB**, including chunked or unknown-length responses. Missing, oversized, malformed, untrusted, or placeholder key material fails closed without changing the installed binary.
+
+To verify a release manually, obtain the production public-key payload and fingerprint from a maintainer-controlled channel, then download `checksums.txt` and `checksums.txt.minisig` from the same release:
+
+```bash
+minisign -VQm checksums.txt -x checksums.txt.minisig -P "$GENTLE_AI_MINISIGN_PUBLIC_KEY"
+# Expected output: repo=Gentleman-Programming/gentle-ai;tag=vX.Y.Z
+sha256sum --check --strict --ignore-missing checksums.txt
+```
+
+Do not bootstrap trust from a public key downloaded only beside the artifacts it verifies. See [Release signing and key rotation](docs/release-signing.md) for the first-signed-release procedure, exact CI injection points, and rotation runbook.
+
+Windows archives and Scoop publication remain omitted until publicly trusted RSA Authenticode signing is provisioned (prefer managed OIDC with Azure Artifact Signing), both amd64 and arm64 executables are signed before archive and checksum generation, and release verification fails if either executable is unsigned.
 
 ### Review a focused staged candidate
 

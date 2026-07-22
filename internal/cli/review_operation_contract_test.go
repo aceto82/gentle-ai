@@ -130,8 +130,8 @@ func TestNegotiatedReviewBindSDDPreservesLegacyResultAndBindingHashes(t *testing
 		writeNegotiatedOperationChange(t, repo, "thin")
 	}
 	lineage := "review-operation-binding"
-	_, legacyStore := finalizeNegotiatedOperationFixture(t, legacyRepo, lineage, false)
-	_, negotiatedStore := finalizeNegotiatedOperationFixture(t, negotiatedRepo, lineage, true)
+	finalizeNegotiatedOperationFixture(t, legacyRepo, lineage, false)
+	finalizeNegotiatedOperationFixture(t, negotiatedRepo, lineage, true)
 
 	var legacyOutput bytes.Buffer
 	if err := RunReview([]string{
@@ -161,10 +161,10 @@ func TestNegotiatedReviewBindSDDPreservesLegacyResultAndBindingHashes(t *testing
 	if !reflect.DeepEqual(legacy, negotiated) {
 		t.Fatalf("negotiated binding changed identities:\nlegacy=%#v\nnegotiated=%#v", legacy, negotiated)
 	}
-	legacyBinding := readReviewOperationFile(t, reviewOperationBindingPath(legacyStore, "thin"))
-	negotiatedBinding := readReviewOperationFile(t, reviewOperationBindingPath(negotiatedStore, "thin"))
-	if !bytes.Equal(legacyBinding, negotiatedBinding) {
-		t.Fatal("contract negotiation changed canonical SDD binding bytes")
+	legacyNative := readReviewOperationRuntimeBinding(t, legacyRepo, "thin")
+	negotiatedNative := readReviewOperationRuntimeBinding(t, negotiatedRepo, "thin")
+	if !reflect.DeepEqual(legacyNative, legacy) || !reflect.DeepEqual(negotiatedNative, negotiated) {
+		t.Fatal("contract negotiation changed native SDD binding authority")
 	}
 	assertNoPrivateReviewOperationFields(t, negotiatedOutput.Bytes())
 }
@@ -196,12 +196,8 @@ func TestNegotiatedReviewBindSDDAcceptsSemanticallyEquivalentCompactReceiptArray
 	}
 	var binding sddstatus.ReviewBinding
 	decodeStrictReviewJSON(t, decodeReviewOperationEnvelope(t, output.Bytes()).Result, &binding)
-	canonical, err := json.Marshal(binding)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := readReviewOperationFile(t, reviewOperationBindingPath(store, "thin")); !bytes.Equal(got, append(canonical, '\n')) {
-		t.Fatal("BIND-SDD did not publish canonical binding bytes")
+	if got := readReviewOperationRuntimeBinding(t, repo, "thin"); !reflect.DeepEqual(got, binding) {
+		t.Fatal("BIND-SDD did not publish the returned binding in native authority")
 	}
 	receiptHash, err := reviewtransaction.HashArtifact(store.ReceiptPath())
 	if after, loadErr := store.Load(); err != nil || loadErr != nil || after.Revision != record.Revision || binding.AuthorityRevision != record.Revision || binding.ReceiptHash != receiptHash {
@@ -453,7 +449,20 @@ func readReviewOperationFile(t *testing.T, path string) []byte {
 	return payload
 }
 
+func readReviewOperationRuntimeBinding(t *testing.T, repo, change string) sddstatus.ReviewBinding {
+	t.Helper()
+	store, err := sddstatus.OpenRuntimeStore(context.Background(), repo, change)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := store.Status()
+	if err != nil || status.Binding == nil {
+		t.Fatalf("native SDD binding status = %#v, err=%v", status, err)
+	}
+	return *status.Binding
+}
+
 func reviewOperationBindingPath(store reviewtransaction.CompactStore, change string) string {
 	common := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(store.Dir))))
-	return filepath.Join(common, "gentle-ai", "sdd-review-bindings", "v1", change, "binding.json")
+	return filepath.Join(common, "gentle-ai", "sdd-runtime", "v1", change, "HEAD")
 }

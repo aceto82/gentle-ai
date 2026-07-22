@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 var (
@@ -22,10 +23,21 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	testHome, err := os.MkdirTemp("", "gentle-ai-reviewtransaction-test-home-*")
+	if err != nil {
+		panic(err)
+	}
+	if err := os.Setenv("HOME", testHome); err != nil {
+		panic(err)
+	}
+	if err := os.Setenv("USERPROFILE", testHome); err != nil {
+		panic(err)
+	}
 	code := m.Run()
 	if snapshotRepoTemplateDir != "" {
 		_ = os.RemoveAll(snapshotRepoTemplateDir)
 	}
+	_ = os.RemoveAll(testHome)
 	os.Exit(code)
 }
 
@@ -112,6 +124,46 @@ func TestSnapshotBuilderCurrentChangesIsCompleteAndPreservesRealIndex(t *testing
 	}
 	if again.Identity != snapshot.Identity || again.CandidateTree != snapshot.CandidateTree {
 		t.Fatalf("snapshot is not deterministic: first=%#v second=%#v", snapshot, again)
+	}
+}
+
+func TestSnapshotBuilderCurrentChangesPreservesRacyCleanDetection(t *testing.T) {
+	requireSnapshotGit(t)
+	repo := initSnapshotRepo(t)
+	gitSnapshot(t, repo, "config", "core.trustctime", "false")
+
+	path := filepath.Join(repo, "racy.txt")
+	fixed := time.Unix(1_700_000_000, 0)
+	writeSnapshotFile(t, repo, "racy.txt", "before\n")
+	if err := os.Chtimes(path, fixed, fixed); err != nil {
+		t.Fatalf("Chtimes(racy baseline): %v", err)
+	}
+	gitSnapshot(t, repo, "add", "--", "racy.txt")
+	gitSnapshot(t, repo, "commit", "-m", "racy baseline")
+
+	indexPath := strings.TrimSpace(gitSnapshot(t, repo, "rev-parse", "--git-path", "index"))
+	if !filepath.IsAbs(indexPath) {
+		indexPath = filepath.Join(repo, indexPath)
+	}
+	if err := os.Chtimes(indexPath, fixed, fixed); err != nil {
+		t.Fatalf("Chtimes(real index): %v", err)
+	}
+	writeSnapshotFile(t, repo, "racy.txt", "after!\n")
+	if err := os.Chtimes(path, fixed, fixed); err != nil {
+		t.Fatalf("Chtimes(racy correction): %v", err)
+	}
+	if gitSnapshotSucceeds(repo, "diff", "--quiet", "--", "racy.txt") {
+		t.Fatal("real Git index did not detect the deliberately racy-clean correction")
+	}
+
+	snapshot, err := (SnapshotBuilder{Repo: repo}).Build(context.Background(), Target{
+		Kind: TargetCurrentChanges, Projection: ProjectionWorkspace, IntendedUntracked: []string{},
+	})
+	if err != nil {
+		t.Fatalf("Build(racy correction) error = %v", err)
+	}
+	if got := gitSnapshot(t, repo, "show", snapshot.CandidateTree+":racy.txt"); got != "after!\n" {
+		t.Fatalf("racy candidate content = %q, want %q", got, "after!\n")
 	}
 }
 

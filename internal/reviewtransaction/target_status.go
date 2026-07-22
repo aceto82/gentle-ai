@@ -105,16 +105,29 @@ type targetStatusCandidate struct {
 // AssessTargetStatus classifies the selected live Git projection against
 // validated authority. It only reads Git objects and authority bytes.
 func AssessTargetStatus(ctx context.Context, repo string, request TargetStatusRequest) (TargetStatusResult, error) {
+	result, _, err := AssessTargetStatusWithSnapshot(ctx, repo, request)
+	return result, err
+}
+
+// AssessTargetStatusWithSnapshot returns the exact live snapshot used for the
+// status classification so callers can derive related routing artifacts from
+// the same immutable candidate tree instead of rereading a mutable worktree.
+func AssessTargetStatusWithSnapshot(ctx context.Context, repo string, request TargetStatusRequest) (TargetStatusResult, Snapshot, error) {
 	if request.LineageID != "" {
 		request.LineageID = strings.TrimSpace(request.LineageID)
 		if err := validateLineageID(request.LineageID); err != nil {
-			return TargetStatusResult{}, err
+			return TargetStatusResult{}, Snapshot{}, err
 		}
 	}
 	live, err := (SnapshotBuilder{Repo: repo}).Build(ctx, request.Target)
 	if err != nil {
-		return TargetStatusResult{}, err
+		return TargetStatusResult{}, Snapshot{}, err
 	}
+	result, err := assessTargetStatusSnapshot(ctx, repo, request, live)
+	return result, live, err
+}
+
+func assessTargetStatusSnapshot(ctx context.Context, repo string, request TargetStatusRequest, live Snapshot) (TargetStatusResult, error) {
 	base := TargetStatusResult{
 		TargetIdentity:      live.Identity,
 		Projection:          targetProjectionFromSnapshot(live),
@@ -122,6 +135,7 @@ func AssessTargetStatus(ctx context.Context, repo string, request TargetStatusRe
 	}
 
 	var compactStores []CompactStore
+	var err error
 	if request.LineageID == "" {
 		compactStores, err = CompactAuthorityLeaves(ctx, repo)
 	} else {

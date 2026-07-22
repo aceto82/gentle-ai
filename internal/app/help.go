@@ -22,6 +22,8 @@ COMMANDS
                Print native SDD phase status for orchestrators
   sdd-continue [change]
                Print native SDD dispatcher routing output
+  sdd-attempt <status|begin|finish|reset> --cwd <repo> --change <change>
+               Read or mutate the artifact-store-agnostic runtime-attempt ledger
   review start [--cwd <repo>] [--base-ref <ref>] [--focus <risk|resilience|readability|reliability>]
   review finalize [--cwd <repo>] [--result <review.json> ...] [--evidence <path>]
   review validate --gate <gate> [--cwd <repo>]

@@ -21,8 +21,9 @@ var Tools = []ToolInfo{
 		Repo:          "gentle-ai",
 		DetectCmd:     nil, // version comes from build-time ldflags (app.Version)
 		VersionPrefix: "v",
-		// gentle-ai: Homebrew when the package is brew-owned, binary release download otherwise.
-		// Windows self-upgrade uses the PowerShell installer so the running binary can exit before replacement.
+		// gentle-ai: Homebrew when the package is brew-owned, authenticated binary
+		// release download on Linux/macOS, and a source-install fallback on Windows
+		// while official Windows distribution is intentionally omitted.
 		InstallMethod: InstallBinary,
 	},
 	{

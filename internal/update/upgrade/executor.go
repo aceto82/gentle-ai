@@ -522,7 +522,7 @@ func ExecuteWithOptions(ctx context.Context, results []update.UpdateResult, prof
 		sp := NewSpinner(pw, msg)
 		toolResult := executeOne(ctx, r, profile, dryRun)
 
-		// Check if the upgrade succeeded but requires immediate exit (Windows self-replace).
+		// Check if the upgrade succeeded but requires immediate exit.
 		// This must be handled BEFORE calling sp.Finish() so the spinner can terminate properly.
 		if toolResult.Status == UpgradeSucceeded && toolResult.ExitRequested {
 			// Finish the spinner with success before exiting.
@@ -600,11 +600,13 @@ func executeOne(ctx context.Context, r update.UpdateResult, profile system.Platf
 }
 
 // effectiveMethod resolves the actual upgrade strategy for a tool on a given platform.
-// Priority order matches the documented install hierarchy: plugin → brew-owned package → Windows installer → go-install → declared method.
+// Priority order matches the documented install hierarchy: plugin → brew-owned
+// package → Windows distribution hold → go-install → declared method.
 //
 //  1. OpenCode plugins are always handled by their own method — never overridden.
 //  2. Homebrew is used only when Homebrew confirms it owns this specific tool.
-//  3. gentle-ai on Windows uses the installer so the running binary can exit before replacement.
+//  3. gentle-ai on Windows stays on the binary strategy, which fails closed to
+//     source-install guidance while official Windows assets are omitted.
 //  4. When Go is available on PATH and the tool has a GoImportPath, go-install is
 //     preferred over a direct binary download.
 //  5. Otherwise the tool's declared InstallMethod is used as-is.
@@ -615,9 +617,11 @@ func effectiveMethod(tool update.ToolInfo, profile system.PlatformProfile) updat
 	if profile.PackageManager == "brew" && homebrewPackageInstalled(tool.Name) {
 		return update.InstallBrew
 	}
-	// Use installer method for gentle-ai on Windows (launches PowerShell installer).
+	// Do not auto-route Windows through Go even when Go is available: go install
+	// may write a different path than the running binary. The binary strategy
+	// returns an explicit, non-mutating source-install fallback instead.
 	if profile.OS == "windows" && tool.Name == "gentle-ai" {
-		return update.InstallInstaller
+		return update.InstallBinary
 	}
 	if profile.GoAvailable && tool.GoImportPath != "" {
 		return update.InstallGoInstall

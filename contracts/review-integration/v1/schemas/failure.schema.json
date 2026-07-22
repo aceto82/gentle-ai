@@ -103,15 +103,32 @@
         }
       }
     },
+    "optional_sha256": {
+      "anyOf": [
+        {"const": ""},
+        {"$ref": "#/$defs/sha256"}
+      ]
+    },
+    "binding_revision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expected", "current"],
+      "properties": {
+        "expected": {"$ref": "#/$defs/optional_sha256"},
+        "current": {"$ref": "#/$defs/optional_sha256"}
+      }
+    },
     "gate_context": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "scope_change"
-      ],
       "properties": {
-        "scope_change": {"$ref": "#/$defs/scope_change"}
-      }
+        "scope_change": {"$ref": "#/$defs/scope_change"},
+        "binding_revision": {"$ref": "#/$defs/binding_revision"}
+      },
+      "oneOf": [
+        {"required": ["scope_change"]},
+        {"required": ["binding_revision"]}
+      ]
     }
   }
 }

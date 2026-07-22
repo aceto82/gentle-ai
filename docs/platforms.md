@@ -10,25 +10,24 @@
 | Linux (Ubuntu/Debian) | apt | Supported |
 | Linux (Arch) | pacman | Supported |
 | Linux (Fedora/RHEL family) | dnf | Supported |
-| Windows 10/11 | PowerShell installer | Supported |
+| Windows 10/11 | Go source install | Supported (binary distribution held) |
 
 Derivatives are detected via `ID_LIKE` in `/etc/os-release` (Linux Mint, Pop!_OS, Manjaro, EndeavourOS, CentOS Stream, Rocky Linux, AlmaLinux, etc.).
 
-Release artifacts are produced by CI. Windows users should install through the PowerShell installer so Gentle AI's built-in updater owns the same binary it installed.
+Release archives are currently produced for macOS and Linux only. Windows source compatibility remains supported, but official Windows executable/archive assets and Scoop publication are temporarily unavailable pending the [Authenticode restoration gate](release-signing.md#windows-distribution-restoration-gate).
 
 ---
 
 ## Windows Notes
 
-- **PowerShell installer** is the recommended Windows install path for Gentle AI:
-  `irm https://raw.githubusercontent.com/Gentleman-Programming/gentle-ai/<version>/scripts/install.ps1 | iex`
-  Replace `<version>` with the latest stable release tag. For stricter environments, download the script and verify it against the release checksums before running it.
-- **Scoop** is supported as a manual-update alternative. If installed through Scoop, update with `scoop update gentle-ai`; do not rely on Gentle AI's built-in updater for the Scoop shim.
+- **Install/update from source** with Go 1.25.10+:
+  `go install github.com/gentleman-programming/gentle-ai/cmd/gentle-ai@latest`.
+- **Scoop and official Windows binaries are temporarily unavailable.** The installer and built-in upgrader fail closed to source-install guidance rather than downloading or executing an unsigned artifact or remote update script.
 - **npm global installs** do not require `sudo` on Windows (user-writable by default).
 - **curl** is pre-installed on Windows 10+ and does not require separate installation.
 - **PowerShell** is the default shell when `$SHELL` is not set.
 - **GGA on Windows** works from both Git Bash and PowerShell. gentle-ai installs a `gga.ps1` shim that automatically delegates to Git Bash, so no manual shell switching is required.
-- **PowerShell installer output** is forced to UTF-8 to avoid garbled icons, and the installer persists the install directory to the user `PATH` while updating the current session for verification.
+- **PowerShell source-installer output** is forced to UTF-8 and installs through Go's configured `GOBIN`/`GOPATH`.
 - **Fresh install detection** falls back to known Engram/GGA install locations when the running process has a stale `PATH`.
 
 ---

@@ -161,7 +161,7 @@ func TestWindowsInstallScriptBetaGoInstallPreservesGoProxyBypassEnv(t *testing.T
 	if start == -1 {
 		t.Fatal("scripts/install.ps1 is missing Add-GoEnvPattern function")
 	}
-	endMarker := "\n}\n\n# ============================================================================\n# Install via binary download"
+	endMarker := "\n}\n\nfunction Test-Installation"
 	end := strings.Index(script[start:], endMarker)
 	if end == -1 {
 		t.Fatal("could not locate end of Add-GoEnvPattern function")
@@ -178,81 +178,4 @@ func TestWindowsInstallScriptBetaGoInstallPreservesGoProxyBypassEnv(t *testing.T
 			t.Fatalf("Add-GoEnvPattern does not preserve existing env patterns; missing %q", want)
 		}
 	}
-}
-
-// TestWindowsInstallScriptChecksumCatchSurfacesRealError verifies that the catch
-// block around checksum download in install.ps1 includes the real exception message
-// ($_.Exception.Message) so the user sees the underlying cause, not a generic
-// "Could not download checksums.txt" message that hides connection errors,
-// TLS failures, etc. The secure-by-default behavior (Stop-WithError when not
-// -Insecure) must be preserved.
-func TestWindowsInstallScriptChecksumCatchSurfacesRealError(t *testing.T) {
-	path := filepath.Join("..", "..", "scripts", "install.ps1")
-	content, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("ReadFile(%q) error = %v", path, err)
-	}
-
-	script := string(content)
-
-	// The catch block must surface the real error via $_.Exception.Message.
-	if !strings.Contains(script, "$_.Exception.Message") {
-		t.Error("scripts/install.ps1 checksum catch block must include $_.Exception.Message to surface the real error; currently hides root cause")
-	}
-
-	// The catch block must still include the checksum URL so the user knows what failed.
-	if !strings.Contains(script, "$checksumsUrl") {
-		t.Error("scripts/install.ps1 checksum catch block must reference $checksumsUrl in the error message")
-	}
-
-	// The insecure skip path must still exist in the catch block.
-	if !strings.Contains(script, "checksum verification skipped") {
-		t.Error("scripts/install.ps1 checksum catch block must retain the -Insecure skip message")
-	}
-
-	// The secure-by-default path must still call Stop-WithError (hard failure).
-	// Locate the catch block and confirm Stop-WithError is present.
-	catchIdx := strings.Index(script, "} catch {")
-	if catchIdx < 0 {
-		t.Fatal("scripts/install.ps1 missing catch block around checksum download")
-	}
-	catchBlock := script[catchIdx:]
-	// Find the closing brace of the catch block (next standalone "}" at indent 0 relative to catch).
-	closeIdx := strings.Index(catchBlock, "\n        }")
-	if closeIdx < 0 {
-		t.Fatal("scripts/install.ps1 could not locate end of catch block")
-	}
-	catchBody := catchBlock[:closeIdx]
-
-	if !strings.Contains(catchBody, "Stop-WithError") {
-		t.Error("scripts/install.ps1 catch block must call Stop-WithError when not -Insecure; secure-by-default behavior must not be changed")
-	}
-}
-
-// TestWindowsInstallScriptFallbackChecksumExecution wires the PowerShell
-// fallback test (scripts/test-hash-fallback.ps1) into the CI validation
-// suite. If pwsh or powershell is available on the machine, it executes
-// the script to ensure the .NET fallback path computes correct SHA256
-// hashes and matches Get-FileHash when both are available.
-func TestWindowsInstallScriptFallbackChecksumExecution(t *testing.T) {
-	scriptPath := filepath.Join("..", "..", "scripts", "test-hash-fallback.ps1")
-	if _, err := os.Stat(scriptPath); err != nil {
-		t.Fatalf("test-hash-fallback.ps1 script not found at %s: %v", scriptPath, err)
-	}
-
-	var shell string
-	if _, err := exec.LookPath("pwsh"); err == nil {
-		shell = "pwsh"
-	} else if _, err := exec.LookPath("powershell"); err == nil {
-		shell = "powershell"
-	} else {
-		t.Skip("PowerShell (pwsh or powershell) not available; skipping fallback execution test")
-	}
-
-	cmd := exec.Command(shell, "-NoProfile", "-NonInteractive", "-File", scriptPath)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("PowerShell fallback test failed: %v\nOutput:\n%s", err, string(out))
-	}
-	t.Logf("PowerShell fallback test output:\n%s", string(out))
 }

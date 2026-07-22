@@ -428,6 +428,17 @@ func TestReviewResultArtifactsPluginContract(t *testing.T) {
 		`spawn("gentle-ai"`,
 		`"review", "capture-result"`,
 		`"review", "preserve-result"`,
+		`"--repository-context", binding.repository_context`,
+		`"--expected-revision", binding.revision`,
+		`return ["--cwd", cwd]`,
+		`const current = fields === "lens,lineage,order,repository_context,revision,subject_hash,target"`,
+		`typeof subject.subject_hash !== "string"`,
+		`subject.subject_hash !== binding.subject_hash`,
+		`const FROZEN_CONTEXT = "GENTLE_AI_FROZEN_CANDIDATE_CONTEXT "`,
+		`artifact_subject`,
+		`candidate_diff`,
+		`changed_path_manifest`,
+		`output.args.prompt = await injectReviewerContext(`,
 		`"--lineage", binding.lineage`,
 		`"--target", binding.target`,
 		`"--lens", binding.lens`,
@@ -437,7 +448,6 @@ func TestReviewResultArtifactsPluginContract(t *testing.T) {
 		`GENTLE_AI_REVIEW_CWD`,
 		`"tool.execute.before"`,
 		`output.args.background === true`,
-		`await preflightCapture(captureCwd(worktree, directory), parseBinding(output.args.prompt, output.args.subagent_type))`,
 		`!BINDING.test(input.args.prompt)`,
 		`const lens = input.args.subagent_type`,
 		`const binding = parseBinding(input.args.prompt, lens)`,
@@ -451,8 +461,19 @@ func TestReviewResultArtifactsPluginContract(t *testing.T) {
 		// Envelope extraction itself can fail; only then is the raw envelope
 		// preserved, under a distinct extraction-failure cause.
 		`throw await preservedCaptureFailure(cwd, binding, output.output, cause)`,
+		`function sessionErrorMessage(binding: ReviewBinding, cause: unknown, code: string): string`,
+		`sessionErrorMessage(binding, cause, "repository_context_preflight_failed")`,
+		`parsed.reference`,
 		`raw reviewer result preserved for recovery`,
 		`raw reviewer result could not be preserved`,
+		// The previously conflated empty/nested-envelope branch must throw two
+		// distinct, machine-readable classified errors instead of one free-text
+		// message, and the plugin must thread that class into --class.
+		`"reviewer task result is empty"`,
+		`"reviewer task result contains a nested task envelope"`,
+		`reviewClass`,
+		`extractionClass(cause)`,
+		`"--class"`,
 		// Double failure (capture and preserve both failed) must embed the
 		// bounded raw payload in the thrown error so the transcript retains it.
 		`raw reviewer result follows for manual recovery`,
@@ -468,6 +489,11 @@ func TestReviewResultArtifactsPluginContract(t *testing.T) {
 	}
 	if strings.Contains(source, `.slice("review-".length)`) {
 		t.Fatal("review-result-artifacts.ts must preserve the exact full selected lens; found review- prefix stripping")
+	}
+	// Pin the split: the previously conflated empty/nested-envelope message
+	// must never regress back into one indistinguishable free-text throw.
+	if strings.Contains(source, `reviewer task result is empty or contains a nested envelope`) {
+		t.Fatal("review-result-artifacts.ts regressed to the conflated empty/nested-envelope error message")
 	}
 	for _, forbidden := range []string{"writeFile", "link(", "chmod(", "createHash", "export {", "export const"} {
 		if strings.Contains(source, forbidden) {
@@ -1459,6 +1485,10 @@ func TestSDDStatusContractMatchesNativeShape(t *testing.T) {
 		"relationships:",
 		"dependsOn: []",
 		"sameDomainActiveChanges: []",
+		"runtimeStatus:",
+		"active_attempt:",
+		"decision_required: false",
+		"next_action: begin | finish | reset | complete",
 		"phaseInstructions:",
 		"blockedReasons: []",
 		"Manual fallback status MUST stay shape-compatible with native `gentle-ai.sdd-status` JSON",
@@ -1701,6 +1731,54 @@ func TestOrchestratorsRequireAutomaticGatekeeper(t *testing.T) {
 		}
 		if !lineContainsAny("does not inspect the code diff", "inspects no code diff")(validatorLine) {
 			t.Fatalf("%s fresh-context phase-contract validator must prohibit code-diff inspection: %q", path, validatorLine)
+		}
+	}
+}
+
+func TestSDDOrchestratorsUseNativeRuntimeAttemptAuthority(t *testing.T) {
+	paths := []string{
+		"antigravity/sdd-orchestrator.md",
+		"claude/sdd-orchestrator.md",
+		"codex/sdd-orchestrator.md",
+		"cursor/sdd-orchestrator.md",
+		"gemini/sdd-orchestrator.md",
+		"generic/sdd-orchestrator.md",
+		"hermes/sdd-orchestrator.md",
+		"kimi/sdd-orchestrator.md",
+		"kiro/sdd-orchestrator.md",
+		"opencode/sdd-orchestrator.md",
+		"qwen/sdd-orchestrator.md",
+		"windsurf/sdd-orchestrator.md",
+	}
+	required := []string{
+		"Native Runtime Attempt Authority",
+		"gentle-ai sdd-attempt status",
+		"gentle-ai sdd-attempt begin",
+		"gentle-ai sdd-attempt finish",
+		"gentle-ai sdd-attempt reset",
+		"decision_required",
+		"expected-binding-revision",
+		"successor-lineage",
+		"remediates-evidence-revision",
+	}
+	for _, path := range paths {
+		content := MustRead(path)
+		if path == "claude/sdd-orchestrator.md" {
+			content += "\n" + MustRead("claude/sdd-orchestrator-workflow.md")
+		}
+		for _, want := range required {
+			if !strings.Contains(content, want) {
+				t.Fatalf("%s missing native runtime-attempt authority wording %q", path, want)
+			}
+		}
+		for _, forbidden := range []string{
+			"gentle-ai.sdd-attempt-ledger/v1",
+			"attempt-ledger-{work-unit}.json",
+			"sdd/{change-name}/attempt-ledger",
+		} {
+			if strings.Contains(content, forbidden) {
+				t.Fatalf("%s still delegates native authority to mutable artifact %q", path, forbidden)
+			}
 		}
 	}
 }

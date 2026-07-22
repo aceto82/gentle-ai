@@ -114,26 +114,19 @@ func AssessCompactGateTarget(ctx context.Context, repo string, state CompactStat
 			return assessment, nil
 		}
 	}
-	if snapshot.BaseTree == state.CurrentSnapshot.BaseTree || snapshot.PathsDigest == state.CurrentSnapshot.PathsDigest ||
-		hasAnyReviewPath(snapshot.Paths, state.GenesisPaths) {
+	relationExpected := state.CurrentSnapshot
+	// PRE-COMMIT deliberately projects the frozen workspace authority through
+	// the staged index. The request builder owns that projection choice, so the
+	// relation algebra compares content/scope inside the selected gate
+	// projection rather than treating the gate's own staged view as unrelated.
+	relationExpected.Projection = snapshot.Projection
+	relation := classifyCompactTargetRelation(relationExpected, snapshot, state.GenesisPaths, compactTargetRelationEvidence{})
+	if relation.Kind != compactTargetUnsafe {
 		assessment.Applicability = CompactGateTargetScopeChanged
 		return assessment, nil
 	}
 	assessment.Applicability = CompactGateTargetUnrelated
 	return assessment, nil
-}
-
-func hasAnyReviewPath(left, right []string) bool {
-	paths := make(map[string]struct{}, len(left))
-	for _, logicalPath := range left {
-		paths[logicalPath] = struct{}{}
-	}
-	for _, logicalPath := range right {
-		if _, ok := paths[logicalPath]; ok {
-			return true
-		}
-	}
-	return false
 }
 
 func compactSquashedFixDelivery(gate GateKind, state CompactState, snapshot Snapshot, refs *resolvedPrePRRefs, finalCandidateTree string) bool {
@@ -293,9 +286,21 @@ func evaluateCompactGate(ctx context.Context, repo string, receipt CompactReceip
 			return invalid(err.Error())
 		}
 	}
+	recoveryBinding, recoveryBound, recoveryErr := deriveCompactRecoveryBinding(ctx, repo, record.State)
+	if recoveryErr != nil {
+		return invalid("compact recovery binding cannot be derived during authorization")
+	}
+	recoveryAdvance := request.Gate == GatePrePR && recoveryBound && snapshot.BaseTree != recoveryBinding.BaseTree
 	compatibleAdvance := false
 	var compatibility *BaseAdvanceCompatibility
-	if request.Gate == GatePrePR && snapshot.BaseTree != receipt.BaseTree {
+	var recoveryCompatibility *BaseAdvanceCompatibility
+	if recoveryAdvance {
+		if proof, proofErr := deriveCompactRecoveryAdvanceCompatibility(ctx, repo, recoveryBinding, request, snapshot, resolvedPrePR, preimages); proofErr == nil {
+			compatibility = &proof
+			recoveryCompatibility = &proof
+			compatibleAdvance = proof.Compatible
+		}
+	} else if request.Gate == GatePrePR && snapshot.BaseTree != receipt.BaseTree {
 		legacyShape := Receipt{BaseTree: receipt.BaseTree, FinalCandidateTree: receipt.FinalCandidateTree, PathsDigest: receipt.PathsDigest}
 		if proof, proofErr := deriveBaseAdvanceCompatibility(ctx, repo, legacyShape, request, snapshot, resolvedPrePR, preimages); proofErr == nil {
 			compatibility = &proof
@@ -332,10 +337,6 @@ func evaluateCompactGate(ctx context.Context, repo string, receipt CompactReceip
 	if strictBinding {
 		baseMismatch = snapshot.BaseTree != binding.BaseTree && !squashedFixDelivery
 	}
-	recoveryBinding, recoveryBound, recoveryErr := deriveCompactRecoveryBinding(ctx, repo, record.State)
-	if recoveryErr != nil {
-		return invalid("compact recovery binding cannot be derived during authorization")
-	}
 	// A scope_changed recovery successor freezes only its own pristine scope,
 	// so a delivery already covered by its receipt-bound predecessors would be
 	// denied here forever. Rebind through the composed recovery chain when the
@@ -343,17 +344,21 @@ func evaluateCompactGate(ctx context.Context, repo string, receipt CompactReceip
 	// evidence proves the chain covers the complete publication range.
 	var recoveryRebind *compactRecoveryBinding
 	if (request.Gate == GatePrePush || request.Gate == GatePrePR) && record.State.Recovery != nil && resolvedPrePR != nil &&
-		(pathsMismatch || baseMismatch) && snapshot.CandidateTree == receipt.FinalCandidateTree {
+		(pathsMismatch || baseMismatch || recoveryAdvance && compatibleAdvance) && snapshot.CandidateTree == receipt.FinalCandidateTree {
 		rebindBaseCommit := resolvedPrePR.BaseCommit
 		if request.Gate == GatePrePush {
 			rebindBaseCommit = request.Target.BaseRef
 		}
-		if chain, ok := rebindCompactRecoveryDelivery(ctx, repo, record.State, snapshot, receipt.FinalCandidateTree, rebindBaseCommit, resolvedPrePR.HeadCommit); ok {
+		if chain, ok := rebindCompactRecoveryDeliveryWithCompatibility(ctx, repo, record.State, snapshot, receipt.FinalCandidateTree, rebindBaseCommit, resolvedPrePR.HeadCommit, recoveryCompatibility); ok {
 			recoveryRebind = &chain
 			pathsMismatch = false
 			gateContext.BaseRelationshipValid = true
 			gateContext.FixDeltaHash = chain.FixDeltaHash
 		}
+	}
+	if recoveryAdvance && recoveryRebind == nil {
+		gateContext.Denial = &GateDenial{Stage: "receipt-binding", Code: "recovery-chain-advance-unproven"}
+		return NativeGateEvaluation{Result: GateInvalidated, Reason: "advanced recovery delivery requires trusted compatibility and full-chain verification", Context: gateContext}
 	}
 	if snapshot.CandidateTree != receipt.FinalCandidateTree || pathsMismatch {
 		gateContext.Denial = &GateDenial{Stage: "receipt-binding", Code: "candidate-or-paths-mismatch"}
@@ -403,6 +408,7 @@ func evaluateCompactGate(ctx context.Context, repo string, receipt CompactReceip
 		return invalid("compact authority or repository target changed during final authorization", cause)
 	}
 	finalCompactGateAllowHook()
+	finalRecoveryBinding := recoveryBinding
 	if recoveryBound {
 		finalChain, ok, chainErr := deriveCompactRecoveryBinding(ctx, repo, finalRecord.State)
 		if chainErr != nil || !ok || !reflect.DeepEqual(finalChain, recoveryBinding) {
@@ -411,14 +417,37 @@ func evaluateCompactGate(ctx context.Context, repo string, receipt CompactReceip
 			}
 			return invalid("compact authority or repository target changed during final authorization", chainErr)
 		}
-		if recoveryRebind == nil && finalRefs != nil && (request.Gate == GatePrePush || request.Gate == GatePrePR) {
+		finalRecoveryBinding = finalChain
+	}
+	if compatibility != nil && compatibility.Status == baseAdvanceCompatibleStatus {
+		finalPreimages, preimageErr := rereadGateArtifactPreimages(request)
+		var finalCompatibility BaseAdvanceCompatibility
+		compatibilityErr := preimageErr
+		if compatibilityErr == nil {
+			if recoveryAdvance {
+				finalCompatibility, compatibilityErr = deriveCompactRecoveryAdvanceCompatibility(ctx, repo, finalRecoveryBinding, request, finalSnapshot, finalRefs, finalPreimages)
+			} else {
+				legacyShape := Receipt{BaseTree: receipt.BaseTree, FinalCandidateTree: receipt.FinalCandidateTree, PathsDigest: receipt.PathsDigest}
+				finalCompatibility, compatibilityErr = deriveBaseAdvanceCompatibility(ctx, repo, legacyShape, request, finalSnapshot, finalRefs, finalPreimages)
+			}
+		}
+		if compatibilityErr != nil || finalCompatibility != *compatibility {
+			if compatibilityErr == nil {
+				compatibilityErr = ErrConcurrentUpdate
+			}
+			return invalid("compatible base evidence changed during final authorization", compatibilityErr)
+		}
+		if recoveryAdvance {
+			recoveryCompatibility = &finalCompatibility
+		}
+	}
+	if recoveryBound {
+		if finalRefs != nil && (request.Gate == GatePrePush || request.Gate == GatePrePR) {
 			baseCommit := finalRefs.BaseCommit
 			if request.Gate == GatePrePush {
 				baseCommit = request.Target.BaseRef
 			}
-			leaf := finalChain.Members[len(finalChain.Members)-1]
-			direct := compactRecoveryBinding{Members: []CompactRecord{leaf}, BaseTree: leaf.State.InitialSnapshot.BaseTree}
-			if verifyCompactRecoveryDelivery(ctx, repo, direct, receipt.FinalCandidateTree, baseCommit, finalRefs.HeadCommit) != nil {
+			if verifyCompactRecoveryRelationDelivery(ctx, repo, finalRecoveryBinding, finalSnapshot, receipt.FinalCandidateTree, baseCommit, finalRefs.HeadCommit, recoveryCompatibility) != nil {
 				return invalid("compact recovery delivery changed during final authorization")
 			}
 		}
@@ -552,7 +581,7 @@ func buildCompactGateRequestWithPushBase(ctx context.Context, repo string, state
 			break
 		}
 		if current.Kind == TargetBaseWorkspaceOverlay {
-			request.Target = Target{Kind: TargetBaseWorkspaceOverlay, Projection: projection, BaseRef: current.BaseTree, IntendedUntracked: intended}
+			request.Target = Target{Kind: TargetBaseWorkspaceOverlay, Projection: projection, BaseRef: state.InitialSnapshot.BaseTree, IntendedUntracked: intended}
 			break
 		}
 		headTree, _, err := (SnapshotBuilder{Repo: repo}).resolveCurrentChangesBase(ctx, projection)

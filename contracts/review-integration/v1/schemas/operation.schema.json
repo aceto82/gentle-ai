@@ -33,8 +33,15 @@
         "action": {"type": "string", "minLength": 1},
         "store_revision": {"$ref": "#/$defs/sha256"},
         "eligibility": {"$ref": "status.schema.json#/$defs/action_eligibility"},
-        "next_transition": {"$ref": "status.schema.json#/$defs/next_transition"}
-      }
+        "next_transition": {"$ref": "status.schema.json#/$defs/next_transition"},
+        "validation_request": {"$ref": "targeted-validation-request.schema.json"}
+      },
+      "allOf": [
+        {
+          "if": {"required": ["validation_request"]},
+          "then": {"properties": {"state": {"const": "correction_required"}}}
+        }
+      ]
     },
     "validate": {
       "type": "object",

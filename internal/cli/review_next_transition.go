@@ -36,10 +36,19 @@ type ReviewTransitionCollection struct {
 }
 
 type ReviewTransitionInput struct {
-	Name             string                     `json:"name"`
-	Schema           string                     `json:"schema"`
-	CaptureOperation string                     `json:"capture_operation"`
-	Arguments        []ReviewTransitionArgument `json:"arguments"`
+	Name                string                                        `json:"name"`
+	Schema              string                                        `json:"schema"`
+	CaptureOperation    string                                        `json:"capture_operation"`
+	Arguments           []ReviewTransitionArgument                    `json:"arguments"`
+	ArtifactSubject     *reviewtransaction.ArtifactSubject            `json:"artifact_subject,omitempty"`
+	CandidateDiff       *reviewtransaction.FrozenCandidateDiff        `json:"candidate_diff,omitempty"`
+	ChangedPathManifest *[]reviewtransaction.ChangedPathManifestEntry `json:"changed_path_manifest,omitempty"`
+	ValidationRequest   *reviewtransaction.TargetedValidationRequest  `json:"validation_request,omitempty"`
+}
+
+type reviewCaptureContext struct {
+	FrozenContext    reviewtransaction.FrozenCandidateContext
+	ArtifactSubjects []reviewtransaction.ArtifactSubject
 }
 
 type ReviewTransitionArgument struct {
@@ -48,21 +57,24 @@ type ReviewTransitionArgument struct {
 }
 
 type ReviewTransitionBinding struct {
-	LineageID      string `json:"lineage_id,omitempty"`
-	Revision       string `json:"revision,omitempty"`
-	TargetIdentity string `json:"target_identity"`
+	LineageID         string `json:"lineage_id,omitempty"`
+	Revision          string `json:"revision,omitempty"`
+	TargetIdentity    string `json:"target_identity"`
+	RepositoryContext string `json:"repository_context,omitempty"`
 }
 
 // ReviewTransitionArtifact deliberately excludes the provider-owned path. The
 // native finalize command discovers the immutable captured bytes itself.
 type ReviewTransitionArtifact struct {
-	Schema         string `json:"schema"`
-	Capability     string `json:"capability"`
-	SHA256         string `json:"sha256"`
-	LineageID      string `json:"lineage_id"`
-	TargetIdentity string `json:"target_identity"`
-	Lens           string `json:"lens"`
-	SelectedOrder  int    `json:"selected_order"`
+	Schema            string                                      `json:"schema"`
+	Capability        string                                      `json:"capability"`
+	SHA256            string                                      `json:"sha256"`
+	LineageID         string                                      `json:"lineage_id"`
+	TargetIdentity    string                                      `json:"target_identity"`
+	Lens              string                                      `json:"lens"`
+	SelectedOrder     int                                         `json:"selected_order"`
+	SubjectHash       string                                      `json:"subject_hash"`
+	AdmissionDecision reviewtransaction.ArtifactAdmissionDecision `json:"admission_decision"`
 }
 
 func newReviewNextTransition(status ReviewTargetStatusResult, selectedLenses []string, artifacts []ReviewTransitionArtifact, evidenceAvailable bool, artifactErr error, input reviewNextTransitionInput) ReviewNextTransition {
@@ -82,7 +94,7 @@ func newReviewNextTransition(status ReviewTargetStatusResult, selectedLenses []s
 	if status.Authority == nil {
 		return reviewStopTransition("missing_authority_binding")
 	}
-	binding := reviewTransitionBinding(status.Authority, status.TargetIdentity)
+	binding := reviewTransitionBinding(status.Authority, status.TargetIdentity, input.RepositoryContext)
 	if status.Action == reviewtransaction.TargetStatusActionReconcileFinalize {
 		return reviewStopTransition("original_finalize_request_required")
 	}
@@ -98,7 +110,7 @@ func newReviewNextTransition(status ReviewTargetStatusResult, selectedLenses []s
 			return reviewStopTransition("captured_artifacts_unverifiable")
 		}
 		if len(artifacts) != len(selectedLenses) {
-			return reviewMissingCaptureTransition(binding, selectedLenses, artifacts)
+			return reviewMissingCaptureTransition(binding, selectedLenses, artifacts, input.CaptureContext)
 		}
 		return reviewExecuteTransition("captured_results_ready", "review.finalize", []ReviewTransitionArgument{
 			{Name: "lineage", Value: binding.LineageID}, {Name: "captured_results", Value: "true"},
@@ -106,6 +118,18 @@ func newReviewNextTransition(status ReviewTargetStatusResult, selectedLenses []s
 	case reviewtransaction.StateCorrectionRequired:
 		if status.Action == reviewtransaction.TargetStatusActionRecover {
 			return reviewRecoveryCollection(status, binding, input)
+		}
+		if input.ValidationRequest != nil {
+			validationBinding := binding
+			validationBinding.TargetIdentity = input.ValidationRequest.CorrectionTargetIdentity
+			return reviewCollectTransition("targeted_validation_required", ReviewTransitionInput{
+				Name: "targeted_validation", Schema: reviewtransaction.TargetedValidationRequestSchema,
+				CaptureOperation: "external.run_targeted_validation", Arguments: reviewBindingArguments(validationBinding),
+				ValidationRequest: input.ValidationRequest,
+			})
+		}
+		if input.CorrectionForecasted {
+			return reviewStopTransition("corrected_candidate_unavailable")
 		}
 		return reviewCollectTransition("correction_plan_required", ReviewTransitionInput{
 			Name: "correction_lines", Schema: "gentle-ai.review-correction-plan/v1", CaptureOperation: "external.plan_correction",
@@ -145,23 +169,36 @@ func newReviewNextTransition(status ReviewTargetStatusResult, selectedLenses []s
 	}
 }
 
-func reviewFinalizeNextTransition(state reviewtransaction.CompactState, revision string, artifacts []ReviewTransitionArtifact, artifactErr error) ReviewNextTransition {
+type reviewFinalizeTransitionContext struct {
+	RepositoryContext string
+	ValidationRequest *reviewtransaction.TargetedValidationRequest
+	CaptureContext    *reviewCaptureContext
+}
+
+func reviewFinalizeNextTransition(state reviewtransaction.CompactState, revision string, artifacts []ReviewTransitionArtifact, artifactErr error, contexts ...reviewFinalizeTransitionContext) ReviewNextTransition {
 	status := ReviewTargetStatusResult{
 		Applicability:  reviewtransaction.TargetApplicabilityCurrent,
 		Authority:      &ReviewTargetStatusAuthority{LineageID: state.LineageID, Revision: revision, State: state.State},
 		TargetIdentity: state.InitialSnapshot.Identity,
 		Frozen:         &ReviewTargetStatusFrozen{Tier: state.RiskLevel},
 	}
+	transitionContext := reviewFinalizeTransitionContext{}
+	if len(contexts) > 0 {
+		transitionContext = contexts[0]
+	}
 	if state.State == reviewtransaction.StateReviewing && artifactErr == nil && len(artifacts) != len(state.SelectedLenses) {
-		return reviewMissingCaptureTransition(reviewTransitionBinding(status.Authority, status.TargetIdentity), state.SelectedLenses, artifacts)
+		return reviewMissingCaptureTransition(reviewTransitionBinding(status.Authority, status.TargetIdentity, transitionContext.RepositoryContext), state.SelectedLenses, artifacts, transitionContext.CaptureContext)
 	}
 	if state.State == reviewtransaction.StateReviewing && artifactErr == nil {
 		return reviewExecuteTransition("captured_results_ready", "review.finalize", []ReviewTransitionArgument{{Name: "lineage", Value: state.LineageID}, {Name: "captured_results", Value: "true"}}, []ReviewTransitionArgument{{Name: "state", Value: "reviewing"}, {Name: "captured_artifacts", Value: "complete"}}, reviewTransitionBinding(status.Authority, status.TargetIdentity), artifacts)
 	}
-	return newReviewNextTransition(status, state.SelectedLenses, artifacts, false, artifactErr, reviewNextTransitionInput{})
+	return newReviewNextTransition(status, state.SelectedLenses, artifacts, false, artifactErr, reviewNextTransitionInput{
+		RepositoryContext: transitionContext.RepositoryContext, ValidationRequest: transitionContext.ValidationRequest,
+		CorrectionForecasted: state.ProposedCorrectionLines != nil, CaptureContext: transitionContext.CaptureContext,
+	})
 }
 
-func reviewMissingCaptureTransition(binding ReviewTransitionBinding, selectedLenses []string, artifacts []ReviewTransitionArtifact) ReviewNextTransition {
+func reviewMissingCaptureTransition(binding ReviewTransitionBinding, selectedLenses []string, artifacts []ReviewTransitionArtifact, context *reviewCaptureContext) ReviewNextTransition {
 	captured := make(map[int]bool, len(artifacts))
 	for _, artifact := range artifacts {
 		captured[artifact.SelectedOrder] = true
@@ -169,7 +206,7 @@ func reviewMissingCaptureTransition(binding ReviewTransitionBinding, selectedLen
 	inputs := make([]ReviewTransitionInput, 0)
 	for order, lens := range selectedLenses {
 		if !captured[order] {
-			inputs = append(inputs, reviewCaptureInput(binding, lens, order))
+			inputs = append(inputs, reviewCaptureInput(binding, lens, order, context))
 		}
 	}
 	if len(inputs) == 0 {
@@ -178,16 +215,46 @@ func reviewMissingCaptureTransition(binding ReviewTransitionBinding, selectedLen
 	return reviewCollectTransition("reviewer_results_required", inputs...)
 }
 
-func reviewCaptureInput(binding ReviewTransitionBinding, lens string, order int) ReviewTransitionInput {
-	return ReviewTransitionInput{
-		Name: "reviewer_result", Schema: reviewReviewerSchemaID, CaptureOperation: "review.capture-result",
-		Arguments: append(reviewBindingArguments(binding), ReviewTransitionArgument{Name: "lens", Value: lens}, ReviewTransitionArgument{Name: "order", Value: fmt.Sprint(order)}),
+func reviewCaptureInput(binding ReviewTransitionBinding, lens string, order int, context *reviewCaptureContext) ReviewTransitionInput {
+	arguments := reviewBindingArguments(binding)
+	if binding.RepositoryContext != "" {
+		arguments = append(arguments, ReviewTransitionArgument{Name: "repository-context", Value: binding.RepositoryContext})
 	}
+	input := ReviewTransitionInput{
+		Name: "reviewer_result", Schema: reviewReviewerSchemaID, CaptureOperation: "review.capture-result",
+		Arguments: append(arguments, ReviewTransitionArgument{Name: "lens", Value: lens}, ReviewTransitionArgument{Name: "order", Value: fmt.Sprint(order)}),
+	}
+	if context != nil && order >= 0 && order < len(context.ArtifactSubjects) {
+		subject := context.ArtifactSubjects[order]
+		diff := context.FrozenContext.CandidateDiff
+		manifest := append([]reviewtransaction.ChangedPathManifestEntry(nil), context.FrozenContext.ChangedPathManifest...)
+		if manifest == nil {
+			manifest = []reviewtransaction.ChangedPathManifestEntry{}
+		}
+		input.ArtifactSubject, input.CandidateDiff, input.ChangedPathManifest = &subject, &diff, &manifest
+	}
+	return input
 }
 
 type reviewNextTransitionInput struct {
 	Gate                                    reviewtransaction.GateKind
 	Successor, Reason, Actor, Authorization string
+	RepositoryContext                       string
+	ValidationRequest                       *reviewtransaction.TargetedValidationRequest
+	CorrectionForecasted                    bool
+	CaptureContext                          *reviewCaptureContext
+}
+
+func newReviewCaptureContext(state reviewtransaction.CompactState, revision string, frozen reviewtransaction.FrozenCandidateContext) (*reviewCaptureContext, error) {
+	subjects := make([]reviewtransaction.ArtifactSubject, len(state.SelectedLenses))
+	for order, lens := range state.SelectedLenses {
+		subject, err := reviewtransaction.NewArtifactSubject(state, revision, frozen, lens, order, "")
+		if err != nil {
+			return nil, fmt.Errorf("derive restart artifact subject %d: %w", order, err)
+		}
+		subjects[order] = subject
+	}
+	return &reviewCaptureContext{FrozenContext: frozen, ArtifactSubjects: subjects}, nil
 }
 
 func (input reviewNextTransitionInput) gate() reviewtransaction.GateKind {
@@ -228,8 +295,12 @@ func reviewBindingArguments(binding ReviewTransitionBinding) []ReviewTransitionA
 	return []ReviewTransitionArgument{{Name: "lineage", Value: binding.LineageID}, {Name: "expected-revision", Value: binding.Revision}, {Name: "target", Value: binding.TargetIdentity}}
 }
 
-func reviewTransitionBinding(authority *ReviewTargetStatusAuthority, target string) ReviewTransitionBinding {
-	return ReviewTransitionBinding{LineageID: authority.LineageID, Revision: authority.Revision, TargetIdentity: target}
+func reviewTransitionBinding(authority *ReviewTargetStatusAuthority, target string, repositoryContext ...string) ReviewTransitionBinding {
+	contextHandle := ""
+	if len(repositoryContext) > 0 {
+		contextHandle = repositoryContext[0]
+	}
+	return ReviewTransitionBinding{LineageID: authority.LineageID, Revision: authority.Revision, TargetIdentity: target, RepositoryContext: contextHandle}
 }
 
 func reviewExecuteTransition(reason, operation string, arguments, preconditions []ReviewTransitionArgument, binding ReviewTransitionBinding, artifacts []ReviewTransitionArtifact) ReviewNextTransition {

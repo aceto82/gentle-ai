@@ -69,7 +69,8 @@
       "properties": { "required": { "const": true } }
     },
     "eligibility": { "$ref": "#/$defs/action_eligibility" },
-    "next_transition": { "$ref": "#/$defs/next_transition" }
+    "next_transition": { "$ref": "#/$defs/next_transition" },
+    "validation_request": { "$ref": "targeted-validation-request.schema.json" }
   },
   "$defs": {
     "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
@@ -95,7 +96,7 @@
     },
     "transition_binding": {
       "type": "object", "additionalProperties": false, "required": ["target_identity"],
-      "properties": { "lineage_id": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" }, "revision": { "$ref": "#/$defs/sha256" }, "target_identity": { "$ref": "#/$defs/sha256" } }
+      "properties": { "lineage_id": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" }, "revision": { "$ref": "#/$defs/sha256" }, "target_identity": { "$ref": "#/$defs/sha256" }, "repository_context": { "type": "string", "pattern": "^rctx1_[0-9a-f]{64}$" } }
     },
     "transition_execution": {
       "type": "object", "additionalProperties": false, "required": ["operation", "arguments", "preconditions", "binding"],
@@ -122,8 +123,16 @@
       "type": "object", "additionalProperties": false, "required": ["name", "schema", "capture_operation", "arguments"],
       "properties": {
         "name": { "type": "string", "pattern": "^[a-z0-9_]+$" }, "schema": { "type": "string", "minLength": 1 }, "capture_operation": { "type": "string", "minLength": 1 },
-        "arguments": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/transition_argument" } }
-      }
+        "arguments": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/transition_argument" } },
+        "validation_request": { "$ref": "targeted-validation-request.schema.json" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "capture_operation": { "const": "external.run_targeted_validation" } }, "required": ["capture_operation"] },
+          "then": { "required": ["validation_request"], "properties": { "schema": { "const": "gentle-ai.review-targeted-validation-request/v1" } } },
+          "else": { "not": { "required": ["validation_request"] } }
+        }
+      ]
     },
     "action_eligibility": {
       "type": "object",
@@ -170,7 +179,7 @@
             "additionalProperties": false,
             "required": ["action", "reason_code"],
             "properties": {
-              "action": { "enum": ["review.abandon", "review.finalize", "review.invalidate", "review.quarantine-legacy", "review.reclaim", "review.reconcile-authority", "review.recover", "review.start", "review.validate"] },
+              "action": { "enum": ["review.abandon", "review.finalize", "review.invalidate", "review.quarantine-legacy", "review.reclaim", "review.reconcile-authority", "review.reconcile-authority-batch", "review.recover", "review.start", "review.validate"] },
               "reason_code": { "type": "string", "pattern": "^[a-z0-9_]+$" }
             }
           }
@@ -230,6 +239,15 @@
           "receipt": {
             "properties": { "status": { "enum": ["expected_missing", "present"] } }
           }
+        }
+      }
+    },
+    {
+      "if": { "required": ["validation_request"] },
+      "then": {
+        "properties": {
+          "applicability": { "const": "current_target" },
+          "authority": { "properties": { "state": { "const": "correction_required" } }, "required": ["state"] }
         }
       }
     }

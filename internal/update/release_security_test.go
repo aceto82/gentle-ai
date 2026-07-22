@@ -3,10 +3,12 @@ package update
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -47,8 +49,8 @@ func TestReleaseWorkflowUsesFailClosedLeastPrivilegeGates(t *testing.T) {
 	if count := strings.Count(workflow, "MINISIGN_SECRET_KEY_BASE64"); count != 1 {
 		t.Errorf("MINISIGN_SECRET_KEY_BASE64 occurs %d times, want exactly once in the isolated materialization step", count)
 	}
-	if count := strings.Count(workflow, "persist-credentials: false"); count != 2 {
-		t.Errorf("persist-credentials: false occurs %d times, want both checkouts to avoid retaining a write-capable token", count)
+	if count := strings.Count(workflow, "persist-credentials: false"); count != 3 {
+		t.Errorf("persist-credentials: false occurs %d times, want all three checkouts to avoid retaining repository credentials", count)
 	}
 	if strings.Contains(workflow, "version: \"~> v2\"") {
 		t.Error("release workflow uses a floating GoReleaser version")
@@ -67,6 +69,97 @@ func TestReleaseWorkflowUsesFailClosedLeastPrivilegeGates(t *testing.T) {
 	}
 	if err := scanner.Err(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReleaseAssetVerifierPreservesReadOnlyRotationVerification(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("release verification runtime is Ubuntu-specific")
+	}
+	for _, command := range []string{"bash", "jq", "sha256sum"} {
+		if _, err := exec.LookPath(command); err != nil {
+			t.Skipf("%s is unavailable: %v", command, err)
+		}
+	}
+
+	makeKey := func(fill byte) string {
+		payload := bytes.Repeat([]byte{fill}, 42)
+		payload[0], payload[1] = 'E', 'd'
+		return base64.StdEncoding.EncodeToString(payload)
+	}
+	firstKey, signingKey := makeKey(1), makeKey(2)
+	fakeBin := t.TempDir()
+	ghLog := filepath.Join(t.TempDir(), "gh-calls.log")
+	writeExecutable := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(fakeBin, name), []byte(content), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeExecutable("gh", `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$GH_CALL_LOG"
+if [[ "$1" == api && "$2" == "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" ]]; then
+  cat <<JSON
+{"tag_name":"$GITHUB_REF_NAME","draft":false,"prerelease":false,"assets":[{"name":"gentle-ai_1.2.3_darwin_amd64.tar.gz"},{"name":"gentle-ai_1.2.3_darwin_arm64.tar.gz"},{"name":"gentle-ai_1.2.3_linux_amd64.tar.gz"},{"name":"gentle-ai_1.2.3_linux_arm64.tar.gz"},{"name":"checksums.txt"},{"name":"checksums.txt.minisig"}]}
+JSON
+  exit 0
+fi
+if [[ "$1" == release && "$2" == download && "$3" == "$GITHUB_REF_NAME" ]]; then
+  shift 3
+  directory=
+  while (( $# > 0 )); do
+    case "$1" in
+      --dir) directory=$2; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [[ -n "$directory" ]]
+  mkdir -p "$directory"
+  for platform in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
+    printf 'archive %s\n' "$platform" >"$directory/gentle-ai_1.2.3_${platform}.tar.gz"
+  done
+  (cd "$directory" && sha256sum gentle-ai_1.2.3_*.tar.gz >checksums.txt)
+  printf 'test signature\n' >"$directory/checksums.txt.minisig"
+  exit 0
+fi
+exit 64
+`)
+	writeExecutable("minisign", `#!/usr/bin/env bash
+set -euo pipefail
+public_key=
+while (( $# > 0 )); do
+  case "$1" in
+    -P) public_key=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[[ "$public_key" == "$EXPECTED_SIGNING_KEY" ]] || exit 1
+printf 'repo=%s;tag=%s\n' "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
+`)
+
+	root := filepath.Clean(filepath.Join("..", ".."))
+	command := exec.Command("bash", "scripts/verify-release-assets.sh")
+	command.Dir = root
+	command.Env = append(os.Environ(),
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"GH_CALL_LOG="+ghLog,
+		"GH_TOKEN=read-only-test-token",
+		"GITHUB_REPOSITORY=Gentleman-Programming/gentle-ai",
+		"GITHUB_REF_NAME=v1.2.3",
+		"MINISIGN_PUBLIC_KEYS="+firstKey+","+signingKey,
+		"EXPECTED_SIGNING_KEY="+signingKey,
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("read-only release verification failed: %v\n%s", err, output)
+	}
+	calls, err := os.ReadFile(ghLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(calls)), "\n")
+	if len(lines) != 2 || !strings.HasPrefix(lines[0], "api repos/") || !strings.HasPrefix(lines[1], "release download v1.2.3 ") {
+		t.Fatalf("release verifier used commands outside the approved read-only surface: %q", lines)
 	}
 }
 
@@ -135,6 +228,8 @@ func TestReleaseSecurityScriptsAreSyntacticallyValidAndFailClosed(t *testing.T) 
 			required: []string{
 				`gh release download`,
 				`minisign -VQ`,
+				`canonicalize-release-public-keys.sh`,
+				`MINISIGN_PUBLIC_KEYS`,
 				`sha256sum --check --strict`,
 				`gentle-ai_${version}_linux_amd64.tar.gz`,
 				`checksums.txt.minisig`,

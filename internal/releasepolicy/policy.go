@@ -642,14 +642,10 @@ jobs:
           version: v2.15.2
           args: release --clean
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           MINISIGN_SECRET_KEY_FILE: ${{ env.MINISIGN_SECRET_KEY_FILE }}
           MINISIGN_PUBLIC_KEYS_CANONICAL: ${{ steps.trust-anchors.outputs.canonical }}
-      - name: Verify published assets from GitHub
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ./scripts/verify-release-assets.sh
       - name: Remove signing material
         if: always()
         run: |
@@ -659,4 +655,25 @@ jobs:
             rm -f "$MINISIGN_SECRET_KEY_FILE"
           fi
           rm -f "$MINISIGN_SIGNING_PUBLIC_KEY_FILE"
+  verify:
+    needs: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact tag
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y minisign
+      - name: Verify published assets from GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MINISIGN_PUBLIC_KEYS: ${{ vars.MINISIGN_PUBLIC_KEYS }}
+        run: ./scripts/verify-release-assets.sh
 `

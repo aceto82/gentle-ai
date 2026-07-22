@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestOfficialReleaseOmitsUnsignedWindowsDistribution(t *testing.T) {
@@ -226,6 +228,54 @@ func TestReleaseDistributionPolicyAssertionFailsClosed(t *testing.T) {
 			},
 		},
 		{
+			name: "post-publication verifier loses release dependency",
+			mutate: func(t *testing.T, root string) {
+				replaceReleasePolicyFile(t, root, filepath.Join(".github", "workflows", "release.yml"),
+					"  verify:\n    needs: release\n",
+					"  verify:\n")
+			},
+		},
+		{
+			name: "post-publication verifier gains write permission",
+			mutate: func(t *testing.T, root string) {
+				replaceReleasePolicyFile(t, root, filepath.Join(".github", "workflows", "release.yml"),
+					"  verify:\n    needs: release\n    runs-on: ubuntu-24.04\n    timeout-minutes: 15\n    permissions:\n      contents: read\n",
+					"  verify:\n    needs: release\n    runs-on: ubuntu-24.04\n    timeout-minutes: 15\n    permissions:\n      contents: write\n")
+			},
+		},
+		{
+			name: "post-publication verifier receives secret token",
+			mutate: func(t *testing.T, root string) {
+				replaceReleasePolicyFile(t, root, filepath.Join(".github", "workflows", "release.yml"),
+					"          GH_TOKEN: ${{ github.token }}\n",
+					"          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n")
+			},
+		},
+		{
+			name: "release job executes post-publication verifier",
+			mutate: func(t *testing.T, root string) {
+				replaceReleasePolicyFile(t, root, filepath.Join(".github", "workflows", "release.yml"),
+					"      - name: Remove signing material\n",
+					"      - name: Verify published assets with write authority\n        env:\n          GH_TOKEN: ${{ github.token }}\n          MINISIGN_PUBLIC_KEYS: ${{ vars.MINISIGN_PUBLIC_KEYS }}\n        run: ./scripts/verify-release-assets.sh\n\n      - name: Remove signing material\n")
+			},
+		},
+		{
+			name: "post-publication verifier job contains extra step",
+			mutate: func(t *testing.T, root string) {
+				replaceReleasePolicyFile(t, root, filepath.Join(".github", "workflows", "release.yml"),
+					"      - name: Verify published assets from GitHub\n",
+					"      - name: Inspect release outside the approved verifier\n        env:\n          GH_TOKEN: ${{ github.token }}\n        run: gh release view \"$GITHUB_REF_NAME\" --repo \"$GITHUB_REPOSITORY\"\n\n      - name: Verify published assets from GitHub\n")
+			},
+		},
+		{
+			name: "prepublication script receives write-scoped job token",
+			mutate: func(t *testing.T, root string) {
+				replaceReleasePolicyFile(t, root, filepath.Join(".github", "workflows", "release.yml"),
+					"      - name: Recheck immutable release provenance\n        env:\n          MINISIGN_PUBLIC_KEYS: ${{ vars.MINISIGN_PUBLIC_KEYS }}\n",
+					"      - name: Recheck immutable release provenance\n        env:\n          MINISIGN_PUBLIC_KEYS: ${{ vars.MINISIGN_PUBLIC_KEYS }}\n          GITHUB_TOKEN: ${{ github.token }}\n")
+			},
+		},
+		{
 			name: "direct GitHub API release creation",
 			mutate: func(t *testing.T, root string) {
 				replaceReleasePolicyFile(t, root, filepath.Join(".github", "workflows", "release.yml"),
@@ -257,6 +307,82 @@ func TestReleaseDistributionPolicyAcceptsSemanticYAMLFormatting(t *testing.T) {
 	}
 }
 
+func TestModifiedReleaseVerifierCannotGainWriteAuthority(t *testing.T) {
+	root := newReleasePolicyFixture(t)
+	verifier := filepath.Join(root, "scripts", "verify-release-assets.sh")
+	file, err := os.OpenFile(verifier, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("\ngh api --method POST repos/Gentleman-Programming/gentle-ai/releases\n"); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := runReleasePolicy(root); err != nil {
+		t.Fatalf("opaque verifier content should be contained by workflow privilege, not source parsing: %v\n%s", err, output)
+	}
+
+	workflowBytes, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow struct {
+		Jobs map[string]struct {
+			Needs       string            `yaml:"needs"`
+			Permissions map[string]string `yaml:"permissions"`
+			Steps       []struct {
+				Name string            `yaml:"name"`
+				Uses string            `yaml:"uses"`
+				Run  string            `yaml:"run"`
+				Env  map[string]string `yaml:"env"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(workflowBytes, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	owner := ""
+	var tokenEnv map[string]string
+	for jobName, job := range workflow.Jobs {
+		for _, step := range job.Steps {
+			if step.Run == "./scripts/verify-release-assets.sh" {
+				if owner != "" {
+					t.Fatal("release verifier is executed by more than one job")
+				}
+				owner = jobName
+				tokenEnv = step.Env
+			}
+		}
+	}
+	job, ok := workflow.Jobs[owner]
+	if !ok || owner != "verify" || job.Needs != "release" || job.Permissions["contents"] != "read" {
+		t.Fatalf("modified verifier is not contained by a dependent contents-read job: owner=%q needs=%q permissions=%v", owner, job.Needs, job.Permissions)
+	}
+	if len(tokenEnv) != 2 || tokenEnv["GH_TOKEN"] != "${{ github.token }}" || tokenEnv["MINISIGN_PUBLIC_KEYS"] != "${{ vars.MINISIGN_PUBLIC_KEYS }}" {
+		t.Fatalf("release verifier receives more than the read-scoped job token: %v", tokenEnv)
+	}
+
+	release := workflow.Jobs["release"]
+	writeTokenRecipients := 0
+	for _, step := range release.Steps {
+		for key, value := range step.Env {
+			if key != "GH_TOKEN" && key != "GITHUB_TOKEN" {
+				continue
+			}
+			writeTokenRecipients++
+			if step.Name != "Run GoReleaser" || step.Run != "" || step.Uses == "" || key != "GITHUB_TOKEN" || value != "${{ github.token }}" {
+				t.Fatalf("write-scoped repository token escapes the sole publisher: step=%q run=%q uses=%q env=%v", step.Name, step.Run, step.Uses, step.Env)
+			}
+		}
+	}
+	if writeTokenRecipients != 1 {
+		t.Fatalf("write-scoped release job exposes %d repository tokens, want only GoReleaser", writeTokenRecipients)
+	}
+}
+
 func newReleasePolicyFixture(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
@@ -275,6 +401,7 @@ func newReleasePolicyFixture(t *testing.T) string {
 		filepath.Join(".github", "workflows", "release.yml"):              readRepositoryFile(t, ".github", "workflows", "release.yml"),
 		filepath.Join("internal", "releasepolicy", "policy.go"):           readRepositoryFile(t, "internal", "releasepolicy", "policy.go"),
 		filepath.Join("internal", "releasepolicycmd", "main.go"):          readRepositoryFile(t, "internal", "releasepolicycmd", "main.go"),
+		filepath.Join("scripts", "verify-release-assets.sh"):              readRepositoryFile(t, "scripts", "verify-release-assets.sh"),
 		filepath.Join("scripts", "verify-release-distribution-policy.sh"): readRepositoryFile(t, "scripts", "verify-release-distribution-policy.sh"),
 		filepath.Join("dist", "artifacts.json"):                           releasePolicyArtifactsFixture,
 	}

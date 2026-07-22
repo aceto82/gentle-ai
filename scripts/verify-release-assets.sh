@@ -8,9 +8,13 @@ die() {
 
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 : "${GITHUB_REF_NAME:?GITHUB_REF_NAME is required}"
-: "${MINISIGN_SIGNING_PUBLIC_KEY_FILE:?MINISIGN_SIGNING_PUBLIC_KEY_FILE is required}"
+: "${MINISIGN_PUBLIC_KEYS:?MINISIGN_PUBLIC_KEYS is required}"
 [[ "$GITHUB_REPOSITORY" == "Gentleman-Programming/gentle-ai" ]] || die "unexpected repository"
-[[ -s "$MINISIGN_SIGNING_PUBLIC_KEY_FILE" ]] || die "signing public key file is unavailable"
+
+if ! canonical_public_keys=$(./scripts/canonicalize-release-public-keys.sh); then
+  die "MINISIGN_PUBLIC_KEYS is not canonical"
+fi
+[[ "$canonical_public_keys" == "$MINISIGN_PUBLIC_KEYS" ]] || die "public-key canonicalization changed the configured value"
 
 tag=$GITHUB_REF_NAME
 [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || die "tag is not exact stable semver"
@@ -50,8 +54,16 @@ if ! diff -u <(printf '%s\n' "${sorted_expected_assets[@]}") <(printf '%s\n' "${
   die "downloaded asset set differs from the API"
 fi
 
-signing_public_key=$(tr -d '\r\n' <"$MINISIGN_SIGNING_PUBLIC_KEY_FILE")
-trusted=$(cd "$download_dir" && minisign -VQ -m checksums.txt -x checksums.txt.minisig -P "$signing_public_key") || die "remote checksum signature verification failed"
+verified=false
+trusted=""
+IFS=',' read -r -a configured_keys <<<"$canonical_public_keys"
+for signing_public_key in "${configured_keys[@]}"; do
+  if trusted=$(cd "$download_dir" && minisign -VQ -m checksums.txt -x checksums.txt.minisig -P "$signing_public_key" 2>/dev/null); then
+    verified=true
+    break
+  fi
+done
+[[ "$verified" == true ]] || die "remote checksum signature verification failed"
 [[ "$trusted" == "repo=$GITHUB_REPOSITORY;tag=$tag" ]] || die "remote trusted comment identity mismatch"
 
 mapfile -t manifest_assets < <(awk 'NF == 2 { print $2 }' "$download_dir/checksums.txt" | LC_ALL=C sort)

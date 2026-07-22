@@ -4,12 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 )
+
+// targetStatusCompactAuthorityReadHook is a deterministic test seam around
+// the read-only compact authority observation. Production leaves it inert.
+var targetStatusCompactAuthorityReadHook = func(string, string, int) {}
+
+const targetStatusCompactAuthorityReadAttempts = 3
 
 // targetStatusAuthorityView is the immutable authority side of one status
 // request. Compact records, graph edges, receipts, and finalize journals are
-// loaded once before any candidate is projected against the live snapshot.
+// observed coherently before projection. Legacy stores remain available so an
+// approved receipt is inspected only after pure target matching selects it.
 type targetStatusAuthorityView struct {
 	compact map[string]targetStatusCandidate
 	legacy  map[string]targetStatusCandidate
@@ -91,22 +97,151 @@ func loadCompactTargetStatusCandidates(ctx context.Context, repo, lineageID stri
 	candidates := make(map[string]targetStatusCandidate, len(selected))
 	for _, store := range selected {
 		record := records[store.lineageID]
-		identity, published, replayable, receiptErr := inspectCompactTargetReceipt(store, record.State)
-		if receiptErr != nil {
-			return nil, receiptErr
+		candidate, loadErr := loadStableCompactTargetStatusCandidate(ctx, store, record)
+		if loadErr != nil {
+			return nil, loadErr
 		}
-		pending, pendingErr := store.PendingFinalizeAttemptReadOnly()
-		if pendingErr != nil {
-			return nil, pendingErr
-		}
-		copy := record
-		candidates[record.State.LineageID] = targetStatusCandidate{
-			version: AuthorityVersionCompact, lineage: record.State.LineageID, compact: &copy,
-			receiptIdentity: identity, receiptPublished: published, receiptReplayable: replayable,
-			pendingFinalize: pending != nil,
-		}
+		candidates[candidate.lineage] = candidate
 	}
 	return candidates, nil
+}
+
+func loadStableCompactTargetStatusCandidate(ctx context.Context, store CompactStore, initial CompactRecord) (targetStatusCandidate, error) {
+	record := initial
+	var lastSemanticError error
+	for attempt := 0; attempt < targetStatusCompactAuthorityReadAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return targetStatusCandidate{}, err
+		}
+		targetStatusCompactAuthorityReadHook(store.lineageID, "after-state", attempt)
+		if err := ctx.Err(); err != nil {
+			return targetStatusCandidate{}, err
+		}
+
+		first, firstErr := inspectCompactTargetArtifacts(ctx, store, record.State, "first", attempt)
+		if err := ctx.Err(); err != nil {
+			return targetStatusCandidate{}, err
+		}
+		observed, loadErr := store.Load()
+		if loadErr != nil {
+			return targetStatusCandidate{}, loadErr
+		}
+		if !compactTargetStatusRecordsEqual(record, observed) {
+			record = observed
+			lastSemanticError = nil
+			continue
+		}
+
+		if firstErr != nil && compactAuthorityOperationalFailure(firstErr) {
+			return targetStatusCandidate{}, firstErr
+		}
+		second, secondErr := inspectCompactTargetArtifacts(ctx, store, observed.State, "second", attempt)
+		if err := ctx.Err(); err != nil {
+			return targetStatusCandidate{}, err
+		}
+		if secondErr != nil && compactAuthorityOperationalFailure(secondErr) {
+			return targetStatusCandidate{}, secondErr
+		}
+		// The first receipt/journal pair precedes the second state observation,
+		// while the second pair follows it. Equal raw identities, canonical
+		// content, and existence therefore make that state observation the
+		// linearization point for the complete authority view.
+		if !compactTargetArtifactSetsEqual(first, second) {
+			record = observed
+			lastSemanticError = nil
+			continue
+		}
+
+		observationErr := errors.Join(firstErr, secondErr)
+		if observationErr != nil {
+			lastSemanticError = observationErr
+			record = observed
+			continue
+		}
+
+		copy := observed
+		return targetStatusCandidate{
+			version: AuthorityVersionCompact, lineage: observed.State.LineageID, compact: &copy,
+			receiptIdentity: second.receipt.artifact.identity, receiptPublished: second.receipt.published,
+			receiptReplayable: second.receipt.replayable, pendingFinalize: second.journal.pending,
+		}, nil
+	}
+	if lastSemanticError != nil {
+		return targetStatusCandidate{}, lastSemanticError
+	}
+	return targetStatusCandidate{}, fmt.Errorf(
+		"%w: compact target status authority %q did not stabilize after %d reads",
+		ErrConcurrentUpdate, store.lineageID, targetStatusCompactAuthorityReadAttempts,
+	)
+}
+
+type compactTargetFinalizeJournalObservation struct {
+	artifact compactTargetArtifactObservation
+	pending  bool
+}
+
+type compactTargetArtifactSetObservation struct {
+	receipt compactTargetReceiptObservation
+	journal compactTargetFinalizeJournalObservation
+}
+
+func inspectCompactTargetArtifacts(
+	ctx context.Context,
+	store CompactStore,
+	state CompactState,
+	pass string,
+	attempt int,
+) (compactTargetArtifactSetObservation, error) {
+	receipt, receiptErr := inspectCompactTargetReceipt(store, state)
+	targetStatusCompactAuthorityReadHook(store.lineageID, "after-"+pass+"-receipt", attempt)
+	if err := ctx.Err(); err != nil {
+		return compactTargetArtifactSetObservation{}, err
+	}
+	journal, journalErr := inspectCompactTargetFinalizeJournal(ctx, store)
+	targetStatusCompactAuthorityReadHook(store.lineageID, "after-"+pass+"-journal", attempt)
+	if pass == "first" {
+		// Preserve the original test seam while the more precise hooks bind the
+		// transition between individual artifact reads.
+		targetStatusCompactAuthorityReadHook(store.lineageID, "after-artifacts", attempt)
+	}
+	if err := ctx.Err(); err != nil {
+		return compactTargetArtifactSetObservation{}, err
+	}
+	return compactTargetArtifactSetObservation{receipt: receipt, journal: journal}, errors.Join(receiptErr, journalErr)
+}
+
+func inspectCompactTargetFinalizeJournal(ctx context.Context, store CompactStore) (compactTargetFinalizeJournalObservation, error) {
+	payload, journal, exists, err := store.loadFinalizeAttemptJournalReadOnly(ctx)
+	if !exists {
+		return compactTargetFinalizeJournalObservation{}, err
+	}
+	observation := compactTargetFinalizeJournalObservation{
+		artifact: newCompactTargetArtifactObservation(payload, nil),
+	}
+	if err != nil {
+		return observation, err
+	}
+	canonical, marshalErr := marshalFinalizeAttemptJournal(journal)
+	if marshalErr != nil {
+		return observation, marshalErr
+	}
+	observation.artifact.canonical = canonical
+	observation.pending = latestPendingFinalizeAttempt(journal) != nil
+	return observation, nil
+}
+
+func compactTargetArtifactSetsEqual(left, right compactTargetArtifactSetObservation) bool {
+	return compactTargetArtifactObservationsEqual(left.receipt.artifact, right.receipt.artifact) &&
+		left.receipt.published == right.receipt.published && left.receipt.replayable == right.receipt.replayable &&
+		compactTargetArtifactObservationsEqual(left.journal.artifact, right.journal.artifact) &&
+		left.journal.pending == right.journal.pending
+}
+
+func compactTargetStatusRecordsEqual(left, right CompactRecord) bool {
+	return left.Revision == right.Revision &&
+		left.State.InitialSnapshot.Identity == right.State.InitialSnapshot.Identity &&
+		left.State.CurrentSnapshot.Identity == right.State.CurrentSnapshot.Identity &&
+		compactStateEqual(left.State, right.State)
 }
 
 func loadLegacyTargetStatusCandidates(ctx context.Context, repo, lineageID string) (map[string]targetStatusCandidate, error) {
@@ -124,17 +259,10 @@ func loadLegacyTargetStatusCandidates(ctx context.Context, repo, lineageID strin
 			return nil, loadErr
 		}
 		transaction := chain.Records[len(chain.Records)-1].Transaction
-		identity := ""
-		if transaction.State == StateApproved {
-			identity, err = inspectLegacyTargetReceipt(store, transaction)
-			if err != nil {
-				return nil, err
-			}
-		}
 		copy := chain
+		storeCopy := store
 		candidates[transaction.LineageID] = targetStatusCandidate{
-			version: AuthorityVersionLegacy, lineage: transaction.LineageID, legacy: &copy,
-			receiptIdentity: identity, receiptPublished: identity != "",
+			version: AuthorityVersionLegacy, lineage: transaction.LineageID, legacy: &copy, legacyStore: &storeCopy,
 		}
 	}
 	return candidates, nil
@@ -201,87 +329,14 @@ func legacyLiveTargetMatchesValidatedSnapshot(transaction Transaction, live Snap
 }
 
 func classifyCompactCorrectionTargetForStatus(ctx context.Context, repo string, existing CompactState, live Snapshot) (compactCorrectionTargetClaim, error) {
-	if existing.State != StateCorrectionRequired || existing.InitialSnapshot.Projection != live.Projection ||
-		!compactStartTargetKindsCompatible(existing.InitialSnapshot.Kind, live.Kind) ||
-		existing.InitialSnapshot.BaseTree != live.BaseTree || len(live.LedgerIDs) != 0 {
-		return compactCorrectionTargetUnclaimed, nil
-	}
-	if compactHistoricalFailedValidator(existing) {
-		if compactEscalatedRecoveryTargetChanged(existing.CurrentSnapshot, live) {
-			return compactCorrectionTargetRecover, nil
-		}
-		return compactCorrectionTargetBlocked, nil
-	}
-	if compactRecoveryAddsGenesisPath(existing, live) {
-		return compactCorrectionTargetRecover, nil
-	}
-	if pathsAreSubset(live.Paths, existing.GenesisPaths) != nil {
-		return compactCorrectionTargetUnclaimed, nil
-	}
-	if compactLiveTargetMatchesValidatedSnapshot(existing, live, false) {
-		if live.CandidateTree == existing.CurrentSnapshot.CandidateTree {
-			return compactCorrectionTargetResume, nil
-		}
-		requested := existing
-		requested.InitialSnapshot = live
-		matches, err := compactStatusCorrectionCandidateMatches(ctx, repo, existing, requested)
-		if err != nil {
-			return compactCorrectionTargetUnclaimed, err
-		}
-		if matches {
-			return compactCorrectionTargetResume, nil
-		}
-	}
-	if compactRecoveryContractsGenesisPaths(existing, live) {
-		return compactCorrectionTargetRecover, nil
-	}
-	return compactCorrectionTargetBlocked, nil
-}
-
-func compactStatusCorrectionCandidateMatches(ctx context.Context, repo string, existing, requested CompactState) (bool, error) {
-	if existing.ProposedCorrectionLines == nil {
-		return false, nil
-	}
-	fix, err := (SnapshotBuilder{Repo: repo}).Build(ctx, Target{
-		Kind: TargetFixDiff, Projection: existing.InitialSnapshot.Projection, BaseRef: existing.CurrentSnapshot.CandidateTree,
-		IntendedUntracked: existing.InitialSnapshot.IntendedUntracked, LedgerIDs: existing.FixFindingIDs,
-	})
-	if err != nil {
-		if targetStatusOperationalFailure(err) {
-			return false, err
-		}
-		return false, nil
-	}
-	if fix.CandidateTree != requested.InitialSnapshot.CandidateTree || pathsAreSubset(fix.Paths, existing.GenesisPaths) != nil {
-		return false, nil
-	}
-	lines, err := (SnapshotBuilder{Repo: repo}).ChangedLines(ctx, fix)
-	if err != nil {
-		if targetStatusOperationalFailure(err) {
-			return false, err
-		}
-		return false, nil
-	}
-	return lines <= existing.CorrectionBudget-existing.CumulativeCorrectionLines, nil
+	requested := existing
+	requested.InitialSnapshot = live
+	return classifyCompactCorrectionTarget(ctx, repo, existing, requested, true)
 }
 
 func targetStatusFailure(base TargetStatusResult, err error) (TargetStatusResult, error) {
-	if targetStatusOperationalFailure(err) {
+	if compactAuthorityOperationalFailure(err) {
 		return TargetStatusResult{}, err
 	}
 	return corruptedTargetStatus(base), nil
-}
-
-func targetStatusOperationalFailure(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-	var timeout *GitCommandTimeoutError
-	var command *GitCommandError
-	var processControl *GitProcessControlError
-	if errors.As(err, &timeout) || errors.As(err, &command) || errors.As(err, &processControl) {
-		return true
-	}
-	var pathErr *os.PathError
-	return errors.As(err, &pathErr) && !errors.Is(err, os.ErrNotExist)
 }

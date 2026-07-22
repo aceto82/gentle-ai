@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -818,8 +819,8 @@ func TestCorrectionRecoveryDispositionMirrorsRecoveryRules(t *testing.T) {
 			}
 			requested := predecessor
 			requested.InitialSnapshot = live
-			if claim := classifyCompactCorrectionTarget(context.Background(), repo, predecessor, requested); claim != compactCorrectionTargetRecover {
-				t.Fatalf("classification = %v, want recover", claim)
+			if claim, err := classifyCompactCorrectionTarget(context.Background(), repo, predecessor, requested, false); err != nil || claim != compactCorrectionTargetRecover {
+				t.Fatalf("classification = %v, %v, want recover", claim, err)
 			}
 			if got := compactCorrectionRecoveryDisposition(predecessor, live); got != tt.want {
 				t.Fatalf("disposition = %q, want %q", got, tt.want)
@@ -1106,6 +1107,738 @@ func TestAssessTargetStatusStillCorruptsMalformedAuthorityGraph(t *testing.T) {
 		got.Replayability != ReplayabilityManualActionRequired {
 		t.Fatalf("malformed graph status = %#v", got)
 	}
+}
+
+func TestAssessTargetStatusIgnoresReceiptlessUnrelatedLegacyHistory(t *testing.T) {
+	requireSnapshotGit(t)
+	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "tracked.txt", "legacy candidate\n")
+	transaction, _, _ := nativeGateFixture(t, repo, "legacy-receiptless-history")
+	store, err := AuthoritativeStore(context.Background(), repo, transaction.LineageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendApprovedStoreChain(t, store, transaction)
+	receiptPath := filepath.Join(store.Dir, "artifacts", "receipt.json")
+	if _, err := os.Stat(receiptPath); !os.IsNotExist(err) {
+		t.Fatalf("receiptless legacy fixture stat = %v, want not-exist", err)
+	}
+	writeSnapshotFile(t, repo, "tracked.txt", "unrelated candidate\n")
+
+	authorityRoot, _, err := reviewAuthorityRoot(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := authorityBytes(t, authorityRoot)
+	got, err := AssessTargetStatus(context.Background(), repo, targetStatusCurrentChangesRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Applicability != TargetApplicabilityUnrelated || got.Action != TargetStatusActionStart ||
+		got.LineageID != "" || got.ReceiptIdentity != "" {
+		t.Fatalf("receiptless unrelated legacy status = %#v", got)
+	}
+	if _, err := os.Stat(receiptPath); !os.IsNotExist(err) {
+		t.Fatalf("status materialized a legacy receipt: %v", err)
+	}
+	if after := authorityBytes(t, authorityRoot); !reflect.DeepEqual(before, after) {
+		t.Fatalf("status mutated receiptless legacy history: before=%v after=%v", before, after)
+	}
+}
+
+func TestAssessTargetStatusReadsCompactPublicationCoherently(t *testing.T) {
+	requireSnapshotGit(t)
+	for _, receiptFirst := range []bool{false, true} {
+		name := "state then receipt"
+		if receiptFirst {
+			name = "receipt then state"
+		}
+		t.Run(name, func(t *testing.T) {
+			repo, store, initial, reviewed, terminal, receipt := compactStatusPublicationFixture(t, "status-publication-"+map[bool]string{false: "state-first", true: "receipt-first"}[receiptFirst])
+			originalHook := targetStatusCompactAuthorityReadHook
+			t.Cleanup(func() { targetStatusCompactAuthorityReadHook = originalHook })
+
+			startPublication := make(chan struct{})
+			publicationDone := make(chan error, 1)
+			go func() {
+				<-startPublication
+				publicationDone <- publishCompactStatusTerminal(store, initial, reviewed, terminal, receipt, receiptFirst)
+			}()
+			var once sync.Once
+			var publicationErr error
+			var expectedState, expectedReceipt []byte
+			targetStatusCompactAuthorityReadHook = func(lineage, phase string, attempt int) {
+				if lineage != terminal.LineageID || phase != "after-state" || attempt != 0 {
+					return
+				}
+				once.Do(func() {
+					close(startPublication)
+					publicationErr = <-publicationDone
+					if publicationErr == nil {
+						expectedState, _ = os.ReadFile(store.StatePath())
+						expectedReceipt, _ = os.ReadFile(store.ReceiptPath())
+					}
+				})
+			}
+
+			got, err := AssessTargetStatus(context.Background(), repo, TargetStatusRequest{
+				Target: Target{Kind: TargetCurrentChanges, IntendedUntracked: []string{}}, LineageID: terminal.LineageID,
+			})
+			if publicationErr != nil {
+				t.Fatalf("publish terminal authority: %v", publicationErr)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Applicability != TargetApplicabilityCurrent || got.State != StateApproved ||
+				got.Action != TargetStatusActionValidate || got.ReceiptIdentity == "" {
+				t.Fatalf("coherent compact publication status = %#v", got)
+			}
+			stateAfter, stateErr := os.ReadFile(store.StatePath())
+			receiptAfter, receiptErr := os.ReadFile(store.ReceiptPath())
+			if stateErr != nil || receiptErr != nil || !bytes.Equal(expectedState, stateAfter) || !bytes.Equal(expectedReceipt, receiptAfter) {
+				t.Fatalf("status mutated published authority: stateErr=%v receiptErr=%v", stateErr, receiptErr)
+			}
+		})
+	}
+}
+
+func TestAssessTargetStatusBindsCompactArtifactPublicationCoherently(t *testing.T) {
+	requireSnapshotGit(t)
+	tests := []struct {
+		name                  string
+		phase                 string
+		initialReceipt        string
+		publishedReceipt      string
+		initialJournal        string
+		publishedJournal      string
+		wantAction            TargetStatusAction
+		wantReplayability     Replayability
+		wantReceiptPayloadKey string
+	}{
+		{
+			name: "missing receipt and journal publish between artifact reads", phase: "after-first-receipt",
+			initialReceipt: "missing", publishedReceipt: "canonical",
+			initialJournal: "missing", publishedJournal: "completed",
+			wantAction: TargetStatusActionValidate, wantReplayability: ReplayabilityNotReplayable,
+			wantReceiptPayloadKey: "canonical",
+		},
+		{
+			name: "missing receipt publishes between artifact reads", phase: "after-first-receipt",
+			initialReceipt: "missing", publishedReceipt: "canonical",
+			initialJournal: "completed", publishedJournal: "completed",
+			wantAction: TargetStatusActionValidate, wantReplayability: ReplayabilityNotReplayable,
+			wantReceiptPayloadKey: "canonical",
+		},
+		{
+			name: "present receipt disappears between artifact reads", phase: "after-first-receipt",
+			initialReceipt: "canonical", publishedReceipt: "missing",
+			initialJournal: "completed", publishedJournal: "completed",
+			wantAction: TargetStatusActionFinalize, wantReplayability: ReplayabilityExactReplaySafe,
+			wantReceiptPayloadKey: "missing",
+		},
+		{
+			name: "present receipt is replaced between artifact reads", phase: "after-first-receipt",
+			initialReceipt: "canonical", publishedReceipt: "alternate",
+			initialJournal: "completed", publishedJournal: "completed",
+			wantAction: TargetStatusActionValidate, wantReplayability: ReplayabilityNotReplayable,
+			wantReceiptPayloadKey: "alternate",
+		},
+		{
+			name: "missing journal becomes pending between artifact observations", phase: "after-artifacts",
+			initialReceipt: "canonical", publishedReceipt: "canonical",
+			initialJournal: "missing", publishedJournal: "pending",
+			wantAction: TargetStatusActionReconcileFinalize, wantReplayability: ReplayabilityStatusRequired,
+			wantReceiptPayloadKey: "canonical",
+		},
+		{
+			name: "missing journal completes between artifact observations", phase: "after-artifacts",
+			initialReceipt: "canonical", publishedReceipt: "canonical",
+			initialJournal: "missing", publishedJournal: "completed",
+			wantAction: TargetStatusActionValidate, wantReplayability: ReplayabilityNotReplayable,
+			wantReceiptPayloadKey: "canonical",
+		},
+		{
+			name: "pending journal disappears between artifact observations", phase: "after-artifacts",
+			initialReceipt: "canonical", publishedReceipt: "canonical",
+			initialJournal: "pending", publishedJournal: "missing",
+			wantAction: TargetStatusActionValidate, wantReplayability: ReplayabilityNotReplayable,
+			wantReceiptPayloadKey: "canonical",
+		},
+		{
+			name: "pending journal completes between artifact observations", phase: "after-artifacts",
+			initialReceipt: "canonical", publishedReceipt: "canonical",
+			initialJournal: "pending", publishedJournal: "completed",
+			wantAction: TargetStatusActionValidate, wantReplayability: ReplayabilityNotReplayable,
+			wantReceiptPayloadKey: "canonical",
+		},
+		{
+			name: "completed journal is replaced between artifact observations", phase: "after-artifacts",
+			initialReceipt: "canonical", publishedReceipt: "canonical",
+			initialJournal: "completed", publishedJournal: "replacement",
+			wantAction: TargetStatusActionValidate, wantReplayability: ReplayabilityNotReplayable,
+			wantReceiptPayloadKey: "canonical",
+		},
+		{
+			name: "completed journal disappears between artifact observations", phase: "after-artifacts",
+			initialReceipt: "canonical", publishedReceipt: "canonical",
+			initialJournal: "completed", publishedJournal: "missing",
+			wantAction: TargetStatusActionValidate, wantReplayability: ReplayabilityNotReplayable,
+			wantReceiptPayloadKey: "canonical",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := newCompactStatusStableArtifactFixture(t, "status-artifact-"+strings.ReplaceAll(tt.name, " ", "-"))
+			if err := replaceCompactStatusArtifact(fixture.store.ReceiptPath(), fixture.receiptPayload(tt.initialReceipt)); err != nil {
+				t.Fatal(err)
+			}
+			if err := replaceCompactStatusArtifact(fixture.store.FinalizeAttemptJournalPath(), fixture.journalPayload(tt.initialJournal)); err != nil {
+				t.Fatal(err)
+			}
+
+			originalHook := targetStatusCompactAuthorityReadHook
+			t.Cleanup(func() { targetStatusCompactAuthorityReadHook = originalHook })
+			publish := make(chan struct{})
+			published := make(chan error, 1)
+			go func() {
+				<-publish
+				err := replaceCompactStatusArtifact(fixture.store.ReceiptPath(), fixture.receiptPayload(tt.publishedReceipt))
+				if err == nil {
+					err = replaceCompactStatusArtifact(fixture.store.FinalizeAttemptJournalPath(), fixture.journalPayload(tt.publishedJournal))
+				}
+				published <- err
+			}()
+			attempts := 0
+			var once sync.Once
+			var publicationErr error
+			targetStatusCompactAuthorityReadHook = func(lineage, phase string, _ int) {
+				if lineage != fixture.state.LineageID {
+					return
+				}
+				if phase == "after-state" {
+					attempts++
+				}
+				if phase == tt.phase {
+					once.Do(func() {
+						close(publish)
+						publicationErr = <-published
+					})
+				}
+			}
+
+			got, err := AssessTargetStatus(context.Background(), fixture.repo, TargetStatusRequest{
+				Target: Target{Kind: TargetCurrentChanges, IntendedUntracked: []string{}}, LineageID: fixture.state.LineageID,
+			})
+			if publicationErr != nil {
+				t.Fatalf("publish compact status artifacts: %v", publicationErr)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantReceipt := fixture.receiptPayload(tt.wantReceiptPayloadKey)
+			wantIdentity := compactStatusArtifactIdentity(wantReceipt)
+			if got.Applicability != TargetApplicabilityCurrent || got.State != StateApproved ||
+				got.Action != tt.wantAction || got.Replayability != tt.wantReplayability ||
+				got.ReceiptIdentity != wantIdentity {
+				t.Fatalf("artifact transition status = %#v, want action=%s replayability=%s receipt=%q", got, tt.wantAction, tt.wantReplayability, wantIdentity)
+			}
+			if attempts != 2 {
+				t.Fatalf("artifact transition stable-read attempts = %d, want 2", attempts)
+			}
+			assertCompactStatusArtifact(t, fixture.store.ReceiptPath(), fixture.receiptPayload(tt.publishedReceipt))
+			assertCompactStatusArtifact(t, fixture.store.FinalizeAttemptJournalPath(), fixture.journalPayload(tt.publishedJournal))
+		})
+	}
+}
+
+func TestAssessTargetStatusBoundsUnstableCompactArtifactReads(t *testing.T) {
+	requireSnapshotGit(t)
+	fixture := newCompactStatusStableArtifactFixture(t, "status-artifact-churn")
+	if err := replaceCompactStatusArtifact(fixture.store.ReceiptPath(), fixture.receiptPayload("canonical")); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceCompactStatusArtifact(fixture.store.FinalizeAttemptJournalPath(), fixture.journalPayload("completed")); err != nil {
+		t.Fatal(err)
+	}
+	originalHook := targetStatusCompactAuthorityReadHook
+	t.Cleanup(func() { targetStatusCompactAuthorityReadHook = originalHook })
+	writes := 0
+	var hookErr error
+	targetStatusCompactAuthorityReadHook = func(lineage, phase string, _ int) {
+		if lineage != fixture.state.LineageID || phase != "after-first-receipt" || hookErr != nil {
+			return
+		}
+		writes++
+		key := "alternate"
+		if writes%2 == 0 {
+			key = "canonical"
+		}
+		hookErr = replaceCompactStatusArtifact(fixture.store.ReceiptPath(), fixture.receiptPayload(key))
+	}
+
+	got, err := AssessTargetStatus(context.Background(), fixture.repo, TargetStatusRequest{
+		Target: Target{Kind: TargetCurrentChanges, IntendedUntracked: []string{}}, LineageID: fixture.state.LineageID,
+	})
+	if hookErr != nil {
+		t.Fatal(hookErr)
+	}
+	if !errors.Is(err, ErrConcurrentUpdate) || got.Applicability == TargetApplicabilityCorrupted {
+		t.Fatalf("unstable artifact status = %#v, error = %T %v", got, err, err)
+	}
+	if writes != 3 {
+		t.Fatalf("unstable artifact attempts = %d, want bounded 3", writes)
+	}
+}
+
+func TestAssessTargetStatusStopsSecondArtifactReadOnContextCancellation(t *testing.T) {
+	requireSnapshotGit(t)
+	fixture := newCompactStatusStableArtifactFixture(t, "status-second-artifact-cancel")
+	if err := replaceCompactStatusArtifact(fixture.store.ReceiptPath(), fixture.receiptPayload("canonical")); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceCompactStatusArtifact(fixture.store.FinalizeAttemptJournalPath(), fixture.journalPayload("completed")); err != nil {
+		t.Fatal(err)
+	}
+	originalHook := targetStatusCompactAuthorityReadHook
+	t.Cleanup(func() { targetStatusCompactAuthorityReadHook = originalHook })
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	targetStatusCompactAuthorityReadHook = func(lineage, phase string, _ int) {
+		if lineage == fixture.state.LineageID && phase == "after-second-receipt" {
+			calls++
+			cancel()
+		}
+	}
+
+	got, err := AssessTargetStatus(ctx, fixture.repo, TargetStatusRequest{
+		Target: Target{Kind: TargetCurrentChanges, IntendedUntracked: []string{}}, LineageID: fixture.state.LineageID,
+	})
+	if !errors.Is(err, context.Canceled) || got.Applicability == TargetApplicabilityCorrupted {
+		t.Fatalf("canceled second artifact read status = %#v, error = %T %v", got, err, err)
+	}
+	if calls != 1 {
+		t.Fatalf("canceled second artifact read calls = %d, want 1", calls)
+	}
+}
+
+func TestAssessTargetStatusStopsSecondArtifactReadOnDeadline(t *testing.T) {
+	requireSnapshotGit(t)
+	fixture := newCompactStatusStableArtifactFixture(t, "status-second-artifact-deadline")
+	if err := replaceCompactStatusArtifact(fixture.store.ReceiptPath(), fixture.receiptPayload("canonical")); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceCompactStatusArtifact(fixture.store.FinalizeAttemptJournalPath(), fixture.journalPayload("completed")); err != nil {
+		t.Fatal(err)
+	}
+	originalHook := targetStatusCompactAuthorityReadHook
+	t.Cleanup(func() { targetStatusCompactAuthorityReadHook = originalHook })
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	calls := 0
+	targetStatusCompactAuthorityReadHook = func(lineage, phase string, _ int) {
+		if lineage == fixture.state.LineageID && phase == "after-second-receipt" {
+			calls++
+			<-ctx.Done()
+		}
+	}
+
+	got, err := AssessTargetStatus(ctx, fixture.repo, TargetStatusRequest{
+		Target: Target{Kind: TargetCurrentChanges, IntendedUntracked: []string{}}, LineageID: fixture.state.LineageID,
+	})
+	if !errors.Is(err, context.DeadlineExceeded) || got.Applicability == TargetApplicabilityCorrupted {
+		t.Fatalf("deadline second artifact read status = %#v, error = %T %v", got, err, err)
+	}
+	if calls != 1 {
+		t.Fatalf("deadline second artifact read calls = %d, want 1", calls)
+	}
+}
+
+func TestAssessTargetStatusBoundsUnstableCompactAuthorityReads(t *testing.T) {
+	requireSnapshotGit(t)
+	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "tracked.txt", "candidate\n")
+	state := newCompactTestState(t, repo, "status-authority-churn")
+	store := storeCompactStartAuthority(t, repo, state)
+	_, originalPayload, err := makeCompactRecord(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alternate := state
+	alternate.PolicyHash = hash("2")
+	_, alternatePayload, err := makeCompactRecord(alternate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalHook := targetStatusCompactAuthorityReadHook
+	t.Cleanup(func() { targetStatusCompactAuthorityReadHook = originalHook })
+	writes := 0
+	var hookErr error
+	targetStatusCompactAuthorityReadHook = func(lineage, phase string, _ int) {
+		if lineage != state.LineageID || phase != "after-state" || hookErr != nil {
+			return
+		}
+		writes++
+		payload := alternatePayload
+		if writes%2 == 0 {
+			payload = originalPayload
+		}
+		hookErr = os.WriteFile(store.StatePath(), payload, 0o644)
+	}
+
+	got, err := AssessTargetStatus(context.Background(), repo, TargetStatusRequest{
+		Target: Target{Kind: TargetCurrentChanges, IntendedUntracked: []string{}}, LineageID: state.LineageID,
+	})
+	if hookErr != nil {
+		t.Fatal(hookErr)
+	}
+	if !errors.Is(err, ErrConcurrentUpdate) || got.Applicability == TargetApplicabilityCorrupted {
+		t.Fatalf("unstable authority status = %#v, error = %T %v", got, err, err)
+	}
+	if writes != 3 {
+		t.Fatalf("unstable authority attempts = %d, want bounded 3", writes)
+	}
+}
+
+func TestAssessTargetStatusStopsStableReadOnContextCancellation(t *testing.T) {
+	requireSnapshotGit(t)
+	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "tracked.txt", "candidate\n")
+	state := newCompactTestState(t, repo, "status-authority-cancel")
+	storeCompactStartAuthority(t, repo, state)
+	originalHook := targetStatusCompactAuthorityReadHook
+	t.Cleanup(func() { targetStatusCompactAuthorityReadHook = originalHook })
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	targetStatusCompactAuthorityReadHook = func(lineage, phase string, _ int) {
+		if lineage == state.LineageID && phase == "after-state" {
+			calls++
+			cancel()
+		}
+	}
+
+	got, err := AssessTargetStatus(ctx, repo, TargetStatusRequest{
+		Target: Target{Kind: TargetCurrentChanges, IntendedUntracked: []string{}}, LineageID: state.LineageID,
+	})
+	if !errors.Is(err, context.Canceled) || got.Applicability == TargetApplicabilityCorrupted {
+		t.Fatalf("canceled coherent read status = %#v, error = %T %v", got, err, err)
+	}
+	if calls != 1 {
+		t.Fatalf("canceled coherent read attempts = %d, want 1", calls)
+	}
+}
+
+func TestAssessTargetStatusStopsStableReadOnDeadline(t *testing.T) {
+	requireSnapshotGit(t)
+	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "tracked.txt", "candidate\n")
+	state := newCompactTestState(t, repo, "status-authority-deadline")
+	storeCompactStartAuthority(t, repo, state)
+	originalHook := targetStatusCompactAuthorityReadHook
+	t.Cleanup(func() { targetStatusCompactAuthorityReadHook = originalHook })
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	calls := 0
+	targetStatusCompactAuthorityReadHook = func(lineage, phase string, _ int) {
+		if lineage == state.LineageID && phase == "after-state" {
+			calls++
+			<-ctx.Done()
+		}
+	}
+
+	got, err := AssessTargetStatus(ctx, repo, TargetStatusRequest{
+		Target: Target{Kind: TargetCurrentChanges, IntendedUntracked: []string{}}, LineageID: state.LineageID,
+	})
+	if !errors.Is(err, context.DeadlineExceeded) || got.Applicability == TargetApplicabilityCorrupted {
+		t.Fatalf("deadline coherent read status = %#v, error = %T %v", got, err, err)
+	}
+	if calls != 1 {
+		t.Fatalf("deadline coherent read attempts = %d, want 1", calls)
+	}
+}
+
+func TestCompactCorrectionTargetStartStatusParity(t *testing.T) {
+	requireSnapshotGit(t)
+	scopeFixture := func(t *testing.T, lineage string) (string, CompactState) {
+		repo, state, _, _ := correctionScopeRecoveryFixture(t, lineage)
+		return repo, state
+	}
+	contractionFixture := func(t *testing.T, lineage string) (string, CompactState) {
+		repo, state, _, _ := correctionContractionRecoveryFixture(t, lineage)
+		return repo, state
+	}
+	historicalFixture := func(t *testing.T, lineage string) (string, CompactState) {
+		repo, state, _, _ := historicalFailedValidatorFixture(t, lineage)
+		return repo, state
+	}
+	tests := []struct {
+		name        string
+		fixture     func(*testing.T, string) (string, CompactState)
+		mutate      func(*testing.T, string) []string
+		prepare     func(*testing.T, *CompactState)
+		want        compactCorrectionTargetClaim
+		operational bool
+	}{
+		{name: "same", fixture: scopeFixture, want: compactCorrectionTargetResume},
+		{name: "contraction", fixture: contractionFixture, mutate: func(t *testing.T, repo string) []string {
+			writeSnapshotFile(t, repo, "deleted.txt", "delete me\n")
+			return []string{}
+		}, want: compactCorrectionTargetRecover},
+		{name: "expansion", fixture: scopeFixture, mutate: func(t *testing.T, repo string) []string {
+			writeSnapshotFile(t, repo, "outside.go", "package outside\n")
+			return []string{"outside.go"}
+		}, want: compactCorrectionTargetRecover},
+		{name: "overlap", fixture: contractionFixture, mutate: func(t *testing.T, repo string) []string {
+			writeSnapshotFile(t, repo, "deleted.txt", "delete me\n")
+			writeSnapshotFile(t, repo, "outside.go", "package outside\n")
+			return []string{"outside.go"}
+		}, want: compactCorrectionTargetRecover},
+		{name: "unrelated", fixture: scopeFixture, mutate: func(t *testing.T, repo string) []string {
+			writeSnapshotFile(t, repo, "tracked.txt", "base\n")
+			writeSnapshotFile(t, repo, "outside.go", "package outside\n")
+			return []string{"outside.go"}
+		}, want: compactCorrectionTargetUnclaimed},
+		{name: "historical exhausted unchanged", fixture: historicalFixture, want: compactCorrectionTargetBlocked},
+		{name: "historical exhausted changed", fixture: historicalFixture, mutate: func(t *testing.T, repo string) []string {
+			writeSnapshotFile(t, repo, "tracked.txt", "changed exhausted target\n")
+			return []string{}
+		}, want: compactCorrectionTargetRecover},
+		{name: "operational error", fixture: scopeFixture, prepare: func(t *testing.T, state *CompactState) {
+			if err := state.BeginCorrection(1); err != nil {
+				t.Fatal(err)
+			}
+		}, mutate: func(t *testing.T, repo string) []string {
+			writeSnapshotFile(t, repo, "tracked.txt", "candidate requiring correction\n")
+			return []string{}
+		}, operational: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, existing := tt.fixture(t, "parity-"+strings.ReplaceAll(tt.name, " ", "-"))
+			if tt.prepare != nil {
+				tt.prepare(t, &existing)
+			}
+			intended := []string{}
+			if tt.mutate != nil {
+				intended = tt.mutate(t, repo)
+			}
+			live, err := (SnapshotBuilder{Repo: repo}).Build(context.Background(), Target{
+				Kind: TargetCurrentChanges, IntendedUntracked: intended,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			requested := existing
+			requested.InitialSnapshot = live
+
+			originalCommand := gitCommandContext
+			if tt.operational {
+				t.Setenv("GENTLE_AI_TARGET_STATUS_GIT_HELPER", "exit73")
+				gitCommandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+					return exec.CommandContext(ctx, os.Args[0], "-test.run=^TestTargetStatusGitHelperProcess$", "--")
+				}
+			}
+			startClaim, startErr := classifyCompactCorrectionTargetForStart(context.Background(), repo, existing, requested)
+			statusClaim, statusErr := classifyCompactCorrectionTargetForStatus(context.Background(), repo, existing, live)
+			gitCommandContext = originalCommand
+
+			if tt.operational {
+				var startGit, statusGit *GitCommandError
+				if !errors.As(startErr, &startGit) || !errors.As(statusErr, &statusGit) ||
+					startGit.ExitCode != 73 || statusGit.ExitCode != 73 {
+					t.Fatalf("operational parity: start=(%v,%T %v) status=(%v,%T %v)", startClaim, startErr, startErr, statusClaim, statusErr, statusErr)
+				}
+				return
+			}
+			if startErr != nil || statusErr != nil || startClaim != tt.want || statusClaim != tt.want {
+				t.Fatalf("claim parity: start=(%v,%v) status=(%v,%v), want %v", startClaim, startErr, statusClaim, statusErr, tt.want)
+			}
+		})
+	}
+}
+
+func compactStatusPublicationFixture(t *testing.T, lineage string) (string, CompactStore, CompactRecord, CompactState, CompactState, CompactReceipt) {
+	t.Helper()
+	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "tracked.txt", "candidate\n")
+	state := newCompactTestState(t, repo, lineage)
+	store := storeCompactStartAuthority(t, repo, state)
+	initial, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := make([]LensResult, len(state.SelectedLenses))
+	for index, lens := range state.SelectedLenses {
+		results[index] = LensResult{Lens: lens, Findings: []Finding{}, Evidence: []string{"reviewed"}}
+	}
+	if err := state.CompleteReview(CompactReviewInput{
+		LensResults: results, Classifications: []FindingEvidence{}, RefuterOutcomes: []EvidenceResult{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reviewed := state
+	if err := state.CompleteVerification([]byte("verified\n"), true); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := state.Receipt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return repo, store, initial, reviewed, state, receipt
+}
+
+type compactStatusStableArtifactFixture struct {
+	repo               string
+	store              CompactStore
+	state              CompactState
+	receiptCanonical   []byte
+	receiptAlternate   []byte
+	journalPending     []byte
+	journalCompleted   []byte
+	journalReplacement []byte
+}
+
+func newCompactStatusStableArtifactFixture(t *testing.T, lineage string) compactStatusStableArtifactFixture {
+	t.Helper()
+	repo, store, initial, reviewed, terminal, receipt := compactStatusPublicationFixture(t, lineage)
+	revision, err := store.Replace(initial.Revision, "review/complete-review", reviewed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Replace(revision, "review/complete-verification", terminal); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := json.MarshalIndent(receipt, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical = append(canonical, '\n')
+	alternate, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alternate = append(alternate, '\n')
+
+	request := finalizeAttemptTestRequest(lineage, record.Revision, "status artifact pending")
+	request.CandidateDigest = FinalizeAttemptValueDigest("candidate", terminal.CurrentSnapshot)
+	request.RequestDigest = FinalizeAttemptRequestDigest(request)
+	pendingAttempt := FinalizeAttempt{Request: request, Transitions: []FinalizeAttemptTransition{}}
+	pending, err := marshalFinalizeAttemptJournal(finalizeAttemptJournal{
+		Schema: finalizeAttemptJournalSchema, Attempts: []FinalizeAttempt{pendingAttempt},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completedAttempt := pendingAttempt
+	completedAttempt.ReceiptPublished = true
+	completedAttempt.Completed = true
+	completed, err := marshalFinalizeAttemptJournal(finalizeAttemptJournal{
+		Schema: finalizeAttemptJournalSchema, Attempts: []FinalizeAttempt{completedAttempt},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacementRequest := finalizeAttemptTestRequest(lineage, record.Revision, "status artifact replacement")
+	replacementRequest.CandidateDigest = FinalizeAttemptValueDigest("candidate", terminal.CurrentSnapshot)
+	replacementRequest.RequestDigest = FinalizeAttemptRequestDigest(replacementRequest)
+	replacementAttempt := FinalizeAttempt{
+		Request: replacementRequest, Transitions: []FinalizeAttemptTransition{}, ReceiptPublished: true, Completed: true,
+	}
+	replacement, err := marshalFinalizeAttemptJournal(finalizeAttemptJournal{
+		Schema: finalizeAttemptJournalSchema, Attempts: []FinalizeAttempt{replacementAttempt},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return compactStatusStableArtifactFixture{
+		repo: repo, store: store, state: terminal,
+		receiptCanonical: canonical, receiptAlternate: alternate,
+		journalPending: pending, journalCompleted: completed, journalReplacement: replacement,
+	}
+}
+
+func (fixture compactStatusStableArtifactFixture) receiptPayload(key string) []byte {
+	switch key {
+	case "missing":
+		return nil
+	case "canonical":
+		return fixture.receiptCanonical
+	case "alternate":
+		return fixture.receiptAlternate
+	default:
+		panic("unknown receipt payload key: " + key)
+	}
+}
+
+func (fixture compactStatusStableArtifactFixture) journalPayload(key string) []byte {
+	switch key {
+	case "missing":
+		return nil
+	case "pending":
+		return fixture.journalPending
+	case "completed":
+		return fixture.journalCompleted
+	case "replacement":
+		return fixture.journalReplacement
+	default:
+		panic("unknown journal payload key: " + key)
+	}
+}
+
+func replaceCompactStatusArtifact(path string, payload []byte) error {
+	if payload == nil {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	return writeAtomic(path, payload, 0o644)
+}
+
+func compactStatusArtifactIdentity(payload []byte) string {
+	if payload == nil {
+		return ""
+	}
+	sum := sha256.Sum256(payload)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func assertCompactStatusArtifact(t *testing.T, path string, want []byte) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if want == nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("artifact %q exists after status: %v", path, err)
+		}
+		return
+	}
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("artifact %q changed after status: err=%v got=%q want=%q", path, err, got, want)
+	}
+}
+
+func publishCompactStatusTerminal(store CompactStore, initial CompactRecord, reviewed, terminal CompactState, receipt CompactReceipt, receiptFirst bool) error {
+	if receiptFirst {
+		if err := WriteCompactReceiptAtomic(store.ReceiptPath(), receipt); err != nil {
+			return err
+		}
+	}
+	revision, err := store.Replace(initial.Revision, "review/complete-review", reviewed)
+	if err != nil {
+		return err
+	}
+	if _, err := store.Replace(revision, "review/complete-verification", terminal); err != nil {
+		return err
+	}
+	if !receiptFirst {
+		return WriteCompactReceiptAtomic(store.ReceiptPath(), receipt)
+	}
+	return nil
 }
 
 func TestTargetStatusGitHelperProcess(t *testing.T) {

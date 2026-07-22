@@ -11,6 +11,7 @@ The compact review store protects valid authority from accidental corruption and
 | Truncated, malformed, or semantically invalid state | Yes | Validation fails closed; existing authority remains unchanged. |
 | Interrupted replacement | Yes | Atomic replacement and filesystem synchronization preserve either the old or new valid record where practical. |
 | Concurrent or stale writer | Yes | A lock plus expected revision rejects stale transitions; an exact retry is idempotent. |
+| STATUS overlaps terminal receipt publication | Yes | A bounded double-collect rechecks state revision and snapshot identities, then requires matching receipt and journal existence, raw identity, and canonical content around that state observation; continuing churn returns a concurrency error. |
 | Repository changes after review | Yes | Gates re-derive evidence from live Git and reject incompatible scope or identity changes. |
 | Historical intended path becomes tracked or disappears | Yes | Read-only status treats frozen membership as receipt-bound history; healthy authority and receipt bytes remain unchanged. |
 | Terminal authority needs another review | Yes | `review recover` creates a distinct audited successor; predecessor state and receipt bytes remain immutable. |

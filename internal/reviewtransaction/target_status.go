@@ -91,6 +91,7 @@ type targetStatusCandidate struct {
 	lineage            string
 	compact            *CompactRecord
 	legacy             *ValidatedChain
+	legacyStore        *Store
 	receiptIdentity    string
 	receiptPublished   bool
 	receiptReplayable  bool
@@ -189,6 +190,17 @@ func assessTargetStatusSnapshot(ctx context.Context, repo string, request Target
 		chain := *candidate.legacy
 		transaction := chain.Records[len(chain.Records)-1].Transaction
 		if legacyLiveTargetMatchesValidatedSnapshot(transaction, live) {
+			if transaction.State == StateApproved {
+				if candidate.legacyStore == nil {
+					return corruptedTargetStatus(base), nil
+				}
+				identity, receiptErr := inspectLegacyTargetReceipt(*candidate.legacyStore, transaction)
+				if receiptErr != nil {
+					return targetStatusFailure(base, receiptErr)
+				}
+				candidate.receiptIdentity = identity
+				candidate.receiptPublished = identity != ""
+			}
 			candidates = append(candidates, candidate)
 		}
 	}
@@ -313,33 +325,67 @@ func inspectLegacyTargetReceipt(store Store, transaction Transaction) (string, e
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
-func inspectCompactTargetReceipt(store CompactStore, state CompactState) (identity string, published, replayable bool, err error) {
+type compactTargetArtifactObservation struct {
+	exists    bool
+	identity  string
+	content   []byte
+	canonical []byte
+}
+
+func newCompactTargetArtifactObservation(payload, canonical []byte) compactTargetArtifactObservation {
+	sum := sha256.Sum256(payload)
+	return compactTargetArtifactObservation{
+		exists: true, identity: "sha256:" + hex.EncodeToString(sum[:]),
+		content: append([]byte(nil), payload...), canonical: append([]byte(nil), canonical...),
+	}
+}
+
+func compactTargetArtifactObservationsEqual(left, right compactTargetArtifactObservation) bool {
+	return left.exists == right.exists && left.identity == right.identity &&
+		bytes.Equal(left.content, right.content) && bytes.Equal(left.canonical, right.canonical)
+}
+
+type compactTargetReceiptObservation struct {
+	artifact   compactTargetArtifactObservation
+	published  bool
+	replayable bool
+}
+
+func inspectCompactTargetReceipt(store CompactStore, state CompactState) (compactTargetReceiptObservation, error) {
 	payload, readErr := os.ReadFile(store.ReceiptPath())
 	if errors.Is(readErr, os.ErrNotExist) {
 		if state.State != StateApproved && state.State != StateEscalated {
-			return "", false, false, nil
+			return compactTargetReceiptObservation{}, nil
 		}
 		if _, deriveErr := state.Receipt(); deriveErr != nil {
-			return "", false, false, fmt.Errorf("derive terminal compact receipt replay proof: %w", deriveErr)
+			return compactTargetReceiptObservation{}, fmt.Errorf("derive terminal compact receipt replay proof: %w", deriveErr)
 		}
-		return "", false, true, nil
+		return compactTargetReceiptObservation{replayable: true}, nil
 	}
 	if readErr != nil {
-		return "", false, false, fmt.Errorf("read compact target receipt: %w", readErr)
+		return compactTargetReceiptObservation{}, fmt.Errorf("read compact target receipt: %w", readErr)
+	}
+	observation := compactTargetReceiptObservation{
+		artifact: newCompactTargetArtifactObservation(payload, nil),
 	}
 	expected, deriveErr := state.Receipt()
 	if deriveErr != nil {
-		return "", false, false, errors.New("non-terminal compact authority has a published receipt")
+		return observation, errors.New("non-terminal compact authority has a published receipt")
 	}
 	existing, parseErr := ParseCompactReceipt(payload)
 	if parseErr != nil {
-		return "", false, false, fmt.Errorf("parse compact target receipt: %w", parseErr)
+		return observation, fmt.Errorf("parse compact target receipt: %w", parseErr)
 	}
 	if !CompactReceiptEqual(existing, expected) {
-		return "", false, false, errors.New("compact target receipt does not equal the derived receipt")
+		return observation, errors.New("compact target receipt does not equal the derived receipt")
 	}
-	sum := sha256.Sum256(payload)
-	return "sha256:" + hex.EncodeToString(sum[:]), true, false, nil
+	canonical, marshalErr := json.MarshalIndent(existing, "", "  ")
+	if marshalErr != nil {
+		return observation, fmt.Errorf("canonicalize compact target receipt: %w", marshalErr)
+	}
+	observation.artifact.canonical = append(canonical, '\n')
+	observation.published = true
+	return observation, nil
 }
 
 // targetStatusAction maps a state to the single operation that state accepts.

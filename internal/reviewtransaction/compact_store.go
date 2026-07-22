@@ -676,7 +676,10 @@ func StartCompactAuthority(ctx context.Context, repo string, request CompactStar
 			continue
 		}
 		if existing.State == StateCorrectionRequired {
-			claim := classifyCompactCorrectionTarget(ctx, requestedStore.repo, existing, request.State)
+			claim, claimErr := classifyCompactCorrectionTargetForStart(ctx, requestedStore.repo, existing, request.State)
+			if claimErr != nil {
+				return CompactStartResult{}, fmt.Errorf("classify compact correction target: %w", claimErr)
+			}
 			switch claim {
 			case compactCorrectionTargetResume, compactCorrectionTargetBlocked:
 				claimants = append(claimants, store)
@@ -919,39 +922,74 @@ const (
 	compactCorrectionTargetRecover
 )
 
-// classifyCompactCorrectionTarget keeps correction ownership bound to the
-// original delivery boundary even when in-genesis bytes change. START may only
-// resume an authorized continuation; otherwise the existing authority blocks a
-// fresh budget. Repository-derived path expansion, and a pure non-empty
-// contraction of genesis scope, remain an explicit recovery.
-func classifyCompactCorrectionTarget(ctx context.Context, repo string, existing, requested CompactState) compactCorrectionTargetClaim {
+func classifyCompactCorrectionTargetForStart(ctx context.Context, repo string, existing, requested CompactState) (compactCorrectionTargetClaim, error) {
+	return classifyCompactCorrectionTarget(ctx, repo, existing, requested, false)
+}
+
+// classifyCompactCorrectionTarget is the single START/STATUS correction
+// ownership evaluator. It keeps correction ownership bound to the original
+// delivery boundary even when in-genesis bytes change. Callers that already
+// built the request-scoped live snapshot may skip duplicate evidence reads;
+// every target relationship and operational error still follows this path.
+func classifyCompactCorrectionTarget(ctx context.Context, repo string, existing, requested CompactState, liveAlreadyValidated bool) (compactCorrectionTargetClaim, error) {
 	live := requested.InitialSnapshot
 	if existing.State != StateCorrectionRequired ||
 		existing.InitialSnapshot.Projection != live.Projection ||
 		!compactStartTargetKindsCompatible(existing.InitialSnapshot.Kind, live.Kind) ||
-		existing.InitialSnapshot.BaseTree != live.BaseTree || len(live.LedgerIDs) != 0 ||
-		(SnapshotBuilder{Repo: repo}).ValidateEvidence(ctx, live) != nil {
-		return compactCorrectionTargetUnclaimed
+		existing.InitialSnapshot.BaseTree != live.BaseTree || len(live.LedgerIDs) != 0 {
+		return compactCorrectionTargetUnclaimed, nil
+	}
+	if !liveAlreadyValidated {
+		if err := (SnapshotBuilder{Repo: repo}).ValidateEvidence(ctx, live); err != nil {
+			if compactAuthorityOperationalFailure(err) {
+				return compactCorrectionTargetUnclaimed, err
+			}
+			return compactCorrectionTargetUnclaimed, nil
+		}
 	}
 	if compactHistoricalFailedValidator(existing) {
 		if compactEscalatedRecoveryTargetChanged(existing.CurrentSnapshot, live) {
-			return compactCorrectionTargetRecover
+			return compactCorrectionTargetRecover, nil
 		}
-		return compactCorrectionTargetBlocked
+		return compactCorrectionTargetBlocked, nil
 	}
 	if compactRecoveryAddsGenesisPath(existing, live) {
-		return compactCorrectionTargetRecover
+		return compactCorrectionTargetRecover, nil
 	}
 	if pathsAreSubset(live.Paths, existing.GenesisPaths) != nil {
-		return compactCorrectionTargetUnclaimed
+		return compactCorrectionTargetUnclaimed, nil
 	}
-	if compactStartCorrectionResume(ctx, repo, existing, requested) {
-		return compactCorrectionTargetResume
+	if compactStartLiveTargetMatchesValidated(existing, requested, false) {
+		if live.CandidateTree == existing.CurrentSnapshot.CandidateTree {
+			return compactCorrectionTargetResume, nil
+		}
+		matches, err := compactCorrectionCandidateMatches(ctx, repo, existing, requested)
+		if err != nil {
+			if compactAuthorityOperationalFailure(err) {
+				return compactCorrectionTargetUnclaimed, err
+			}
+		} else if matches {
+			return compactCorrectionTargetResume, nil
+		}
 	}
 	if compactRecoveryContractsGenesisPaths(existing, live) {
-		return compactCorrectionTargetRecover
+		return compactCorrectionTargetRecover, nil
 	}
-	return compactCorrectionTargetBlocked
+	return compactCorrectionTargetBlocked, nil
+}
+
+func compactAuthorityOperationalFailure(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrConcurrentUpdate) {
+		return true
+	}
+	var timeout *GitCommandTimeoutError
+	var command *GitCommandError
+	var processControl *GitProcessControlError
+	if errors.As(err, &timeout) || errors.As(err, &command) || errors.As(err, &processControl) {
+		return true
+	}
+	var pathErr *os.PathError
+	return errors.As(err, &pathErr) && !errors.Is(err, os.ErrNotExist)
 }
 
 // compactCorrectionRecoveryDisposition names the `review recover --disposition`
@@ -984,31 +1022,37 @@ func compactStartInitialSnapshotsEqual(existing, requested CompactState) bool {
 		existing.InitialSnapshot.CandidateTree == requested.InitialSnapshot.CandidateTree
 }
 
-func compactStartCorrectionResume(ctx context.Context, repo string, existing, requested CompactState) bool {
-	return compactStartLiveTargetMatches(ctx, repo, existing, requested, false) &&
-		(requested.InitialSnapshot.CandidateTree == existing.CurrentSnapshot.CandidateTree || compactStartCorrectionCandidateMatches(ctx, repo, existing, requested))
-}
-
-func compactStartCorrectionCandidateMatches(ctx context.Context, repo string, existing, requested CompactState) bool {
+func compactCorrectionCandidateMatches(ctx context.Context, repo string, existing, requested CompactState) (bool, error) {
 	if existing.ProposedCorrectionLines == nil {
-		return false
+		return false, nil
 	}
 	fix, err := (SnapshotBuilder{Repo: repo}).Build(ctx, Target{Kind: TargetFixDiff,
 		Projection: existing.InitialSnapshot.Projection, BaseRef: existing.CurrentSnapshot.CandidateTree,
 		IntendedUntracked: existing.InitialSnapshot.IntendedUntracked, LedgerIDs: existing.FixFindingIDs})
-	if err != nil || fix.CandidateTree != requested.InitialSnapshot.CandidateTree || pathsAreSubset(fix.Paths, existing.GenesisPaths) != nil {
-		return false
+	if err != nil {
+		return false, err
+	}
+	if fix.CandidateTree != requested.InitialSnapshot.CandidateTree || pathsAreSubset(fix.Paths, existing.GenesisPaths) != nil {
+		return false, nil
 	}
 	lines, err := (SnapshotBuilder{Repo: repo}).ChangedLines(ctx, fix)
-	return err == nil && lines <= existing.CorrectionBudget-existing.CumulativeCorrectionLines
+	if err != nil {
+		return false, err
+	}
+	return lines <= existing.CorrectionBudget-existing.CumulativeCorrectionLines, nil
 }
 
 func compactStartLiveTargetMatches(ctx context.Context, repo string, existing, requested CompactState, requireCurrentCandidate bool) bool {
+	return compactStartLiveTargetMatchesValidated(existing, requested, requireCurrentCandidate) &&
+		(SnapshotBuilder{Repo: repo}).ValidateEvidence(ctx, requested.InitialSnapshot) == nil
+}
+
+func compactStartLiveTargetMatchesValidated(existing, requested CompactState, requireCurrentCandidate bool) bool {
 	if existing.Generation != requested.Generation || existing.PolicyHash != requested.PolicyHash ||
 		!reflect.DeepEqual(existing.Recovery, requested.Recovery) {
 		return false
 	}
-	return compactLiveTargetMatchesSnapshot(ctx, repo, existing, requested.InitialSnapshot, requireCurrentCandidate)
+	return compactLiveTargetMatchesValidatedSnapshot(existing, requested.InitialSnapshot, requireCurrentCandidate)
 }
 
 func compactStartScopeEqual(existing, requested CompactState) bool {
